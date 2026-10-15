@@ -61,7 +61,8 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 | `--hook {off,move,copy}` | `off` | Đưa đoạn âm thanh cao trào nhất lên đầu: `move` chuyển hẳn (tổng thời lượng không đổi), `copy` nhân bản (dài thêm đúng độ dài hook) |
 | `--hook-len` | `3` | Độ dài hook (giây) |
 | `--micro-cut` / `--no-micro-cut` | bật | Cắt nhịp: cứ mỗi `--micro-period` (1.2 s) bỏ `--micro-len` (0.1 s), cả hình lẫn tiếng |
-| `--bg-video-dir` / `--bg-audio-vol` / `--bg-scale` | — / `0.03` / `0.85` | Thư mục video nền: chọn ngẫu nhiên 1 video đặt dưới video chính (lặp lại, bắt đầu ở vị trí ngẫu nhiên), tiếng của nó trộn 3%, video chính thu còn 85% khung |
+| `--bg-video-dir` / `--bg-audio-vol` / `--bg-scale` | — / `0.03` / `0.85` | Thư mục video nền đặt dưới video chính, tiếng trộn 3%, video chính thu còn 85% khung |
+| `--bg-segment` | `2` | Video nền ghép từ các đoạn N giây, cả hình lẫn tiếng; mỗi đoạn lấy từ video nền khác đoạn trước. `0` = 1 video chạy liền |
 | `--hook-dir` / `--intro-trim` | — / `3` | Thư mục clip mở đầu (2–3 s): chọn ngẫu nhiên 1 clip, bỏ 3 s đầu của video gốc và ghép clip vào đầu |
 | `--overlay-4k` / `--overlay-opacity` / `--no-overlay` | tự tạo / `0.06` | Lớp phủ ngà lạnh trên cùng: file texture (ảnh hoặc video), bỏ trống thì tự tạo lớp màu `#EEF1F4` |
 | `--seed` | | Cố định tham số ngẫu nhiên để tái lập |
@@ -87,6 +88,13 @@ thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt th
 → `eq=contrast=1.15:brightness=-0.03:saturation=1.08` → `colorbalance=rs=-0.05:gs=0.01:bs=0.08:rh=-0.04:gh=0.02:bh=0.06` + `hue=h=<-4..4>`
 → FX → phụ đề → ghost overlay (`color=c=white@0.015:s=150x150`, toạ độ theo `sin(t*gx)`, `cos(t*gy)`) → lớp phủ ngà lạnh
 → hạt nhiễu `noise=alls=3:allf=t+u` ở tầng cuối cùng.
+
+**Video nền chia đoạn** (`--bg-video-dir`, `--bg-segment 2`): mỗi video mở tối đa 3 video nền, mỗi video chạy liền
+từ một vị trí ngẫu nhiên (lặp lại nếu ngắn). Mỗi đoạn 2 s (60 frame 29.97) chọn một nguồn khác đoạn trước:
+hình dùng `fps` + `select` theo số thứ tự frame rồi `interleave`, nên điểm cắt rơi đúng ranh giới frame;
+tiếng của mỗi nguồn chỉ bật trong các đoạn của nguồn đó (cùng ranh giới với hình, khối 10 ms). Thư mục chỉ có
+1 video thì dùng chính video đó ở 2 vị trí khác nhau. Vì số video mở cùng lúc cố định, RAM không tăng theo độ dài
+video (đo được khoảng 280 MB cho 80 s video nền). File hỏng hoặc không có hình trong thư mục được bỏ qua kèm cảnh báo.
 
 **Clip mở đầu** (`--hook-dir`): bỏ 3 s đầu video gốc, đưa clip mở đầu và video gốc về cùng khung 1080×1920 rồi nối bằng
 `concat`. Cả hai cùng đi qua tăng tốc, cắt nhịp, chỉnh màu và 6 bước xử lý âm thanh. Phụ đề `.srt` được dời theo độ dài clip mở đầu.

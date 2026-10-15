@@ -115,6 +115,8 @@ class Config:
     intro_trim: float = 3.0       # so giay dau video goc bi bo khi co clip mo dau
     bg_video_files: list[Path] = field(default_factory=list)  # video nen duoi video chinh
     bg_audio_vol: float = 0.03
+    bg_segment: float = 2.0       # video nen ghep tu cac doan N giay (ca tieng); 0 = 1 video chay lien
+    bg_max_sources: int = 3       # so video nen mo cung luc (RAM khong tang theo do dai video)
 
     @property
     def fast_rate(self) -> int:
@@ -222,9 +224,10 @@ class Params:
     shake_phase: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     intro: Path | None = None
     intro_info: MediaInfo | None = None
-    bg_video: Path | None = None
-    bg_video_info: MediaInfo | None = None
-    bg_video_start: float = 0.0
+    # Video nen: cac nguon (file, thong tin, giay bat dau) + nguon cua tung doan bg_seg_frames frame
+    bg_sources: list[tuple[Path, MediaInfo, float]] = field(default_factory=list)
+    bg_owner: list[int] = field(default_factory=list)
+    bg_seg_frames: int = 0
 
     def input_keys(self) -> list[str]:
         """Thu tu cac input ffmpeg phu (input 0 luon la video goc)."""
@@ -233,8 +236,7 @@ class Params:
             keys.append("intro")
         if self.bgm:
             keys.append("bgm")
-        if self.bg_video:
-            keys.append("bgv")
+        keys += [f"bgv{j}" for j in range(len(self.bg_sources))]
         if self.overlay_file:
             keys.append("tex")
         return keys
@@ -486,23 +488,74 @@ def probe_cached(path: Path) -> MediaInfo:
     return probe(path)
 
 
+def usable_videos(files: list[Path], what: str) -> list[tuple[Path, MediaInfo]]:
+    """Bo qua file hong / khong co hinh (bao 1 lan), loi neu khong con file nao dung duoc."""
+    ok = []
+    for f in files:
+        try:
+            ok.append((f, probe_cached(f)))
+        except (RuntimeError, ValueError, OSError) as exc:
+            if f not in _warned_files:
+                _warned_files.add(f)
+                log(f"[canh bao] bo qua {what} '{f.name}': {exc}")
+    if not ok:
+        raise RuntimeError(f"khong co {what} nao dung duoc")
+    return ok
+
+
+_warned_files: set[Path] = set()
+
+
+def pick_bg(cfg: Config, rng: random.Random, kept_frames: int):
+    """Video nen ghep tu cac doan cfg.bg_segment giay, moi doan lay tu 1 nguon khac doan truoc.
+
+    Chi mo toi da cfg.bg_max_sources video (moi video chay lien tu vi tri ngau nhien, doan nao cua
+    no thi hien hinh + tieng cua no) nen RAM khong tang theo do dai video.
+    Tra ve (nguon, nguon cua tung doan, so frame moi doan).
+    """
+    if not cfg.bg_video_files:
+        return [], [], 0
+    files = usable_videos(cfg.bg_video_files, "video nen")
+    if cfg.bg_segment > 0:
+        seg = max(1, round(cfg.bg_segment * 30000 / 1001))
+        n_win = math.ceil(kept_frames / seg)
+    else:  # 1 video chay lien
+        seg, n_win = kept_frames, 1
+    k = 1 if n_win == 1 else min(cfg.bg_max_sources, max(2, len(files)))
+    # 1 file ma can 2 nguon: dung chinh file do o 2 vi tri khac nhau (cat nhay)
+    chosen = rng.sample(files, k) if len(files) >= k else [files[i % len(files)] for i in range(k)]
+    owner, prev = [], None
+    for _ in range(n_win):
+        j = rng.choice([i for i in range(k) if i != prev])
+        owner.append(j)
+        prev = j
+    used = sorted(set(owner))  # bo nguon khong duoc doan nao dung
+    remap = {j: i for i, j in enumerate(used)}
+    sources = []
+    for j in used:
+        f, info = chosen[j]
+        start = rng.uniform(0, info.duration * 0.8) if info.duration > 2 else 0.0
+        sources.append((f, info, round(start, 3)))
+    return sources, [remap[j] for j in owner], seg
+
+
 def make_params(cfg: Config, base_duration: float, rng: random.Random, name: str,
                 bgm_files: list[Path], edit: Edit | None = None) -> Params:
     """base_duration: thoi luong video goc sau cat lang/hook/bo 3s dau (chua tinh clip mo dau)."""
-    intro = rng.choice(cfg.intro_files) if cfg.intro_files else None
-    intro_info = probe_cached(intro) if intro else None
+    intro, intro_info = rng.choice(usable_videos(cfg.intro_files, "clip mo dau")) if cfg.intro_files \
+        else (None, None)
     src_duration = base_duration + (intro_info.duration if intro_info else 0.0)
-    out_duration = output_frames(cfg, src_duration)[1] * 1001 / 30000
-    bg_video = rng.choice(cfg.bg_video_files) if cfg.bg_video_files else None
-    bg_info = probe_cached(bg_video) if bg_video else None
+    kept = output_frames(cfg, src_duration)[1]
+    out_duration = kept * 1001 / 30000
+    bg_sources, bg_owner, bg_seg = pick_bg(cfg, rng, kept)
     return Params(
         edit=edit,
         src_duration=src_duration,
         intro=intro,
         intro_info=intro_info,
-        bg_video=bg_video,
-        bg_video_info=bg_info,
-        bg_video_start=round(rng.uniform(0, bg_info.duration * 0.8), 3) if bg_info and bg_info.duration > 2 else 0.0,
+        bg_sources=bg_sources,
+        bg_owner=bg_owner,
+        bg_seg_frames=bg_seg,
         pan=(round(rng.uniform(*cfg.pan_period), 3), round(rng.uniform(0, 2 * math.pi), 3),
              round(rng.uniform(*cfg.pan_period), 3), round(rng.uniform(0, 2 * math.pi), 3)),
         shake_phase=tuple(round(rng.uniform(0, 2 * math.pi), 3) for _ in range(4)),
@@ -740,6 +793,50 @@ def camera_expr(cfg: Config, p: Params, scaled: str, size: int, wave: str, axis:
     return f"clip({margin}+{drift}+{shake},0,{scaled}-{size})"
 
 
+def _bg_windows(p: Params, j: int) -> list[int]:
+    return [w for w, o in enumerate(p.bg_owner) if o == j]
+
+
+def bg_video_lines(cfg: Config, p: Params, g: list[str], kept: int) -> None:
+    """Hinh video nen -> nhan [bgvid]: dung kept frame, khop tung frame voi video chinh.
+
+    Moi nguon: dua ve luoi 29.97 FPS bat dau tu 0, chi giu frame thuoc cac doan cua no (theo so
+    thu tu frame nen cat dung ranh gioi), roi interleave cac nguon theo thoi gian.
+    """
+    W, H, F = cfg.width, cfg.height, p.bg_seg_frames
+    labels = []
+    for j in range(len(p.bg_sources)):
+        keep = "+".join(f"gte(n,{w * F})*lt(n,{(w + 1) * F})" for w in _bg_windows(p, j))
+        g.append(f"[{p.idx(f'bgv{j}')}:v]setpts=PTS-STARTPTS,fps={FPS}:start_time=0,select='{keep}',"
+                 f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,"
+                 f"format=yuv420p[bgs{j}]")
+        labels.append(f"[bgs{j}]")
+    mix = f"interleave=nb_inputs={len(labels)}," if len(labels) > 1 else ""
+    g.append("".join(labels) + f"{mix}fps={FPS}:start_time=0,setpts=N*1001/30000/TB,"
+             f"tpad=stop_mode=clone:stop_duration=1,trim=end_frame={kept}[bgvid]")
+
+
+def bg_audio_lines(p: Params, g: list[str]) -> str | None:
+    """Tieng video nen: moi nguon chi phat trong cac doan cua no (cung ranh gioi voi hinh)."""
+    D = p.bg_seg_frames * 1001 / 30000
+    labels = []
+    for j, (_f, info, _start) in enumerate(p.bg_sources):
+        if not info.has_audio:
+            continue
+        chain = f"[{p.idx(f'bgv{j}')}:a:0]asetpts=PTS-STARTPTS,{AFMT}"
+        if len(p.bg_sources) > 1:  # bat/tat theo doan, khoi 10 ms
+            on = "+".join(f"gte(t,{w * D:.6f})*lt(t,{(w + 1) * D:.6f})" for w in _bg_windows(p, j))
+            chain += f",asetnsamples=n=441:p=0,volume=eval=frame:volume='{on}'"
+        g.append(chain + f"[bga{j}]")
+        labels.append(f"[bga{j}]")
+    if not labels:
+        return None
+    if len(labels) == 1:
+        return labels[0][1:-1]
+    g.append("".join(labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[bgamix]")
+    return "bgamix"
+
+
 def blur_lines(cfg: Config, g: list[str], src: str, dst: str) -> str:
     """Lam mo vung hardsub/logo (ti le theo khung W x H). Tra ve nhan dau ra."""
     if not cfg.blur_box:
@@ -817,11 +914,8 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
     if cfg.colorbalance:
         color.append(f"colorbalance={cfg.colorbalance}")
     color.append(f"hue=h={p.hue}")  # eq khong co tham so hue -> dung filter hue
-    if p.bg_video:
-        # Lap lai, bat dau o vi tri ngau nhien, ep ve W x H 29.97 FPS yuv420p. PTS = so frame *
-        # 1001/30000 nen khop tung frame voi video chinh (overlay khong lap/rot frame).
-        g.append(f"[{p.idx('bgv')}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
-                 f"setsar=1,fps={FPS},setpts=N*1001/30000/TB,format=yuv420p[bgvid]")
+    if p.bg_sources:
+        bg_video_lines(cfg, p, g, kept)
         fw, fh = even(W * cfg.bg_scale), even(H * cfg.bg_scale)
         g.append(f"[{last}]scale={fw}:{fh}:force_original_aspect_ratio=decrease:"
                  f"force_divisible_by=2,setsar=1[fgv]")
@@ -902,8 +996,9 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
     if p.bgm:
         g.append(f"[{p.idx('bgm')}:a:0]{AFMT},volume={p.bgm_volume},{fade}[bgm]")
         layers.append("bgm")
-    if p.bg_video and p.bg_video_info.has_audio:  # tieng cua video nen, 3%
-        g.append(f"[{p.idx('bgv')}:a:0]{AFMT},volume={cfg.bg_audio_vol},{fade}[bgva]")
+    bg_audio = bg_audio_lines(p, g)  # tieng video nen, cat theo dung cac doan hinh
+    if bg_audio:
+        g.append(f"[{bg_audio}]volume={cfg.bg_audio_vol},{fade}[bgva]")
         layers.append("bgva")
     labels = "".join(f"[{x}]" for x in layers)
     g.append(f"[voice]{labels}amix=inputs={1 + len(layers)}:duration=first:normalize=0[vm]")
@@ -946,8 +1041,12 @@ def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file
             cmd += ["-ss", f"{h0:.3f}", "-t", f"{h1 - h0:.3f}", "-i", str(src)]
         elif key == "intro":  # clip mo dau
             cmd += ["-i", str(p.intro.resolve())]
-        elif key == "bgv":  # video nen: lap lai, bat dau o vi tri ngau nhien
-            cmd += ["-stream_loop", "-1", "-ss", f"{p.bg_video_start:.3f}", "-i", str(p.bg_video.resolve())]
+        elif key.startswith("bgv"):  # nguon video nen: lap lai, bat dau o vi tri ngau nhien
+            f, _info, start = p.bg_sources[int(key[3:])]
+            total = output_frames(cfg, p.src_duration)[1] * 1001 / 30000
+            # -t: nguon phai ket thuc de interleave biet het du lieu; giai ma 1 luong cho nhe may
+            cmd += ["-threads", "1", "-stream_loop", "-1", "-ss", f"{start:.3f}", "-t", f"{total + 1:.3f}",
+                    "-i", str(f.resolve())]
         elif key == "bgm":
             cmd += ["-stream_loop", "-1", "-i", str(p.bgm.resolve())]
         elif key == "tex":
@@ -1123,7 +1222,8 @@ def format_result(r: Result) -> str:
             f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
             f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
             + (f" mo_dau={p.intro.name}" if p.intro else "")
-            + (f" video_nen={p.bg_video.name}@{p.bg_video_start:g}s" if p.bg_video else "")
+            + (f" video_nen={'+'.join(dict.fromkeys(f.name for f, _, _ in p.bg_sources))}"
+               + (f" ({len(p.bg_owner)} doan)" if len(p.bg_owner) > 1 else "") if p.bg_sources else "")
             + describe_edit(p.edit))
 
 
@@ -1163,7 +1263,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                                        "thay cho 3 giay dau video goc")
     ap.add_argument("--intro-trim", type=float, default=3.0,
                     help="so giay dau video goc bi bo khi co --hook-dir (mac dinh: 3)")
-    ap.add_argument("--bg-video-dir", help="thu muc video nen: chon ngau nhien 1 video dat duoi video chinh")
+    ap.add_argument("--bg-video-dir", help="thu muc video nen dat duoi video chinh")
+    ap.add_argument("--bg-segment", type=float, default=2.0,
+                    help="video nen ghep tu cac doan N giay (ca hinh va tieng), moi doan lay tu video "
+                         "nen ngau nhien khac doan truoc; 0 = 1 video chay lien (mac dinh: 2)")
     ap.add_argument("--bg-audio-vol", type=float, default=0.03,
                     help="am luong tieng video nen (mac dinh: 0.03 = 3%%)")
     ap.add_argument("--fx-interval", type=float, nargs=2, metavar=("MIN", "MAX"), default=[3.0, 6.0],
@@ -1239,6 +1342,7 @@ def config_from_args(a: argparse.Namespace) -> Config:
         grain=max(0.0, a.grain),
         intro_trim=max(0.0, a.intro_trim),
         bg_audio_vol=min(1.0, max(0.0, a.bg_audio_vol)),
+        bg_segment=max(0.0, a.bg_segment),
         fx_interval=None if a.no_fx else rng_pair(a.fx_interval, "--fx-interval"),
         rotate_deg=a.rotate,
         flip=a.flip,
@@ -1449,6 +1553,7 @@ class GuiApp:
         self.bgv_on_var = tk.BooleanVar(value=s.get("bgv_on", bgv_dir.is_dir()))
         self.bgv_var = tk.StringVar(value=s.get("bgv", str(bgv_dir) if bgv_dir.is_dir() else ""))
         self.zoom_var = tk.StringVar(value=s.get("zoom_level", "1.23"))
+        self.bgseg_var = tk.StringVar(value=s.get("bg_segment", "2.0"))
         self.status_var = tk.StringVar(value="Thêm video rồi bấm Bắt đầu.")
 
         self._build()
@@ -1544,6 +1649,12 @@ class GuiApp:
             ttk.Entry(opt, textvariable=path_var).grid(row=row, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
             for col, (label, cmd) in enumerate(buttons, start=2):
                 ttk.Button(opt, text=label, command=cmd).grid(row=row, column=col, padx=(6, 0), pady=(6, 0))
+        segf = ttk.Frame(opt)  # canh dong video nen: do dai moi doan
+        segf.grid(row=8, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
+        ttk.Label(segf, text="cắt mỗi").pack(side="left")
+        ttk.Spinbox(segf, from_=0, to=10, increment=0.5, width=4, format="%.1f",
+                    textvariable=self.bgseg_var).pack(side="left", padx=4)
+        ttk.Label(segf, text="giây (0 = không cắt)").pack(side="left")
         jf = ttk.Frame(opt)
         jf.grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(jf, text="Zoom gốc:").pack(side="left")
@@ -1688,6 +1799,15 @@ class GuiApp:
                                    parent=self.root)
             return
         argv += ["--zoom-level", f"{zoom:g}"]
+        try:
+            bgseg = float(self.bgseg_var.get().replace(",", "."))
+        except ValueError:
+            bgseg = -1.0
+        if not 0 <= bgseg <= 60:
+            messagebox.showwarning("Video Chuẩn", "Độ dài mỗi đoạn video nền phải từ 0 đến 60 giây "
+                                   "(0 = không cắt).", parent=self.root)
+            return
+        argv += ["--bg-segment", f"{bgseg:g}"]
         for on_var, path_var, opt, what in ((self.intro_on_var, self.intro_var, "--hook-dir", "thư mục clip mở đầu"),
                                             (self.bgv_on_var, self.bgv_var, "--bg-video-dir", "thư mục video nền")):
             if on_var.get():
@@ -1854,7 +1974,8 @@ class GuiApp:
                 "micro_cut": self.micro_var.get(),
                 "overlay_on": self.overlay_on_var.get(), "overlay": self.overlay_var.get(),
                 "intro_on": self.intro_on_var.get(), "intro": self.intro_var.get(),
-                "bgv_on": self.bgv_on_var.get(), "bgv": self.bgv_var.get(), "zoom_level": self.zoom_var.get()}
+                "bgv_on": self.bgv_on_var.get(), "bgv": self.bgv_var.get(), "zoom_level": self.zoom_var.get(),
+                "bg_segment": self.bgseg_var.get()}
         try:
             SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         except OSError:

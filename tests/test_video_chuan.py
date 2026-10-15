@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import re
 import shutil
@@ -287,26 +288,34 @@ class TestIntroAndBgVideo(unittest.TestCase):
         self.assertEqual(vc.pick_hook(energy, 3.0, 20.0, start=3.0), (10.0, 13.0))
 
     def test_graph_and_command(self):
-        cfg = vc.Config(intro_files=[Path("/x/intro.mp4")], bg_video_files=[Path("/x/bgv.mp4")])
+        # bg_segment=0: 1 video nen chay lien
+        cfg = vc.Config(intro_files=[Path("/x/intro.mp4")], bg_video_files=[Path("/x/bgv.mp4")], bg_segment=0)
         p = self._params(cfg)
         self.assertAlmostEqual(p.src_duration, 17.0 + 2.5)
-        self.assertEqual(p.input_keys(), ["intro", "bgv"])
+        self.assertEqual(p.input_keys(), ["intro", "bgv0"])
+        kept = vc.output_frames(cfg, p.src_duration)[1]
+        self.assertEqual((p.bg_owner, p.bg_seg_frames), ([0], kept))
         g = vc.build_filter_graph(cfg, p, INFO)
         for s in [
             "[0:v]setpts=PTS-STARTPTS,select='between(t,3.000,20.000)'",  # bo 3s dau
             "[1:v]split[ibg0][ifg0]",  # clip mo dau ngang -> nen mo, dua ve 1080x1920
             "[ifit][iaud][mfit][maud]concat=n=2:v=1:a=1[vin][ain]",
             "[vin]setpts=(PTS-STARTPTS)/1.065",
-            "[2:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,"
-            "fps=30000/1001,setpts=N*1001/30000/TB,format=yuv420p[bgvid]",
+            f"[2:v]setpts=PTS-STARTPTS,fps=30000/1001:start_time=0,select='gte(n,0)*lt(n,{kept})',"
+            "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p[bgs0]",
+            f"setpts=N*1001/30000/TB,tpad=stop_mode=clone:stop_duration=1,trim=end_frame={kept}[bgvid]",
             "[bgvid][fgv]overlay=(W-w)/2:(H-h)/2:shortest=1",
-            "[2:a:0]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.03,",
+            "[2:a:0]asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[bga0]",
+            "[bga0]volume=0.03,",
             "[voice][noise][bgva]amix=inputs=3:duration=first:normalize=0",
             "[ain]asetpts=PTS-STARTPTS",
         ]:
             self.assertIn(s, g)
+        self.assertNotIn("interleave", g)
         cmd = " ".join(vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4"))
-        self.assertIn(f"-i /in.mp4 -i /x/intro.mp4 -stream_loop -1 -ss {p.bg_video_start:.3f} -i /x/bgv.mp4", cmd)
+        start = p.bg_sources[0][2]
+        self.assertIn(f"-i /in.mp4 -i /x/intro.mp4 -threads 1 -stream_loop -1 -ss {start:.3f} "
+                      f"-t {kept * 1001 / 30000 + 1:.3f} -i /x/bgv.mp4", cmd)
 
     def test_cli(self):
         cfg = vc.config_from_args(vc.parse_args(["x.mp4", "--zoom-level", "1.3", "--shake", "0"]))
@@ -316,6 +325,116 @@ class TestIntroAndBgVideo(unittest.TestCase):
         for bad in (["--hook-dir", "/khong/co"], ["--bg-video-dir", "/khong/co"], ["--zoom-level", "0.9"]):
             with self.assertRaises(SystemExit):
                 vc.config_from_args(vc.parse_args(["x.mp4", *bad]))
+
+
+class TestBgSegments(unittest.TestCase):
+    """Video nen ghep tu cac doan 2s (hinh + tieng), moi doan tu 1 nguon khac doan truoc."""
+
+    def _pick(self, names, kept=600, seg=2.0, broken=()):
+        def fake_probe(path):
+            if Path(path).name in broken:
+                raise RuntimeError("file khong co luong video")
+            return vc.MediaInfo(30.0, 720, 1280, True)
+        cfg = vc.Config(bg_video_files=[Path(f"/bg/{n}") for n in names], bg_segment=seg)
+        with mock.patch.object(vc, "probe_cached", fake_probe), mock.patch.object(vc, "log"):
+            return cfg, vc.pick_bg(cfg, random.Random(3), kept)
+
+    def test_windows_and_sources(self):
+        _, (sources, owner, seg) = self._pick(["a.mp4", "b.mp4", "c.mp4", "d.mp4", "e.mp4"])
+        self.assertEqual(seg, 60)  # 2s = 60 frame 29.97
+        self.assertEqual(len(owner), 10)  # 600 frame / 60
+        self.assertLessEqual(len(sources), 3)  # toi da 3 video mo cung luc
+        self.assertTrue(all(a != b for a, b in zip(owner, owner[1:])))  # moi 2s doi nguon
+        self.assertEqual(sorted(set(owner)), list(range(len(sources))))  # khong co nguon thua
+        self.assertTrue(all(0 <= s <= 24 for _, _, s in sources))
+
+    def test_single_file_uses_two_positions(self):
+        _, (sources, owner, _) = self._pick(["only.mp4"])
+        self.assertEqual([f.name for f, _, _ in sources], ["only.mp4", "only.mp4"])
+        self.assertNotEqual(sources[0][2], sources[1][2])
+        self.assertTrue(all(a != b for a, b in zip(owner, owner[1:])))
+
+    def test_continuous_and_broken_files(self):
+        _, (sources, owner, seg) = self._pick(["a.mp4", "b.mp4"], seg=0)
+        self.assertEqual((len(sources), owner, seg), (1, [0], 600))
+        _, (sources, _, _) = self._pick(["bad.mp4", "a.mp4", "b.mp4"], broken={"bad.mp4"})
+        self.assertNotIn("bad.mp4", {f.name for f, _, _ in sources})
+        with self.assertRaises(RuntimeError):
+            self._pick(["bad.mp4"], broken={"bad.mp4"})
+
+    def test_graph(self):
+        cfg, (sources, owner, seg) = self._pick(["a.mp4", "b.mp4"], kept=240)
+        p = params(vc.Config())  # tham so ngau nhien khac; video nen gan tu pick_bg o tren
+        p.bg_sources, p.bg_owner, p.bg_seg_frames = sources, owner, seg
+        p.src_duration = 240 * 1001 / 30000 * cfg.speed / (11 / 12)  # ~240 frame sau cat nhip
+        kept = vc.output_frames(cfg, p.src_duration)[1]
+        g = vc.build_filter_graph(cfg, p, INFO)
+        win = {j: [w for w, o in enumerate(owner) if o == j] for j in range(len(sources))}
+        for j, ws in win.items():
+            self.assertIn("select='" + "+".join(f"gte(n,{w * 60})*lt(n,{(w + 1) * 60})" for w in ws) + "'", g)
+            on = "+".join(f"gte(t,{w * 2.002:.6f})*lt(t,{(w + 1) * 2.002:.6f})" for w in ws)
+            self.assertIn(f"asetnsamples=n=441:p=0,volume=eval=frame:volume='{on}'[bga{j}]", g)
+        self.assertIn(f"[bgs0][bgs1]interleave=nb_inputs=2,fps=30000/1001:start_time=0,"
+                      f"setpts=N*1001/30000/TB,tpad=stop_mode=clone:stop_duration=1,trim=end_frame={kept}[bgvid]", g)
+        self.assertIn("[bga0][bga1]amix=inputs=2:duration=longest:normalize=0[bgamix]", g)
+        self.assertIn("[bgamix]volume=0.03,", g)
+        cmd = vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4")
+        self.assertEqual(cmd.count("-stream_loop"), 2)
+        self.assertEqual([cmd[i + 1] for i, a in enumerate(cmd) if a == "-threads"], ["1", "1"])
+
+    def test_cli(self):
+        self.assertEqual(vc.config_from_args(vc.parse_args(["x.mp4"])).bg_segment, 2.0)
+        self.assertEqual(vc.config_from_args(vc.parse_args(["x.mp4", "--bg-segment", "0"])).bg_segment, 0.0)
+
+
+def goertzel(samples, freq, rate):
+    """Nang luong cua 1 tan so trong doan mau (khong can numpy)."""
+    k = 2 * math.cos(2 * math.pi * freq / rate)
+    s1 = s2 = 0.0
+    for x in samples:
+        s1, s2 = x + k * s1 - s2, s1
+    return s1 * s1 + s2 * s2 - k * s1 * s2
+
+
+@unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
+class TestBgSegmentsRender(unittest.TestCase):
+    def test_video_and_audio_cut_together(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "bgv").mkdir()
+            run = lambda *a: subprocess.run(["ffmpeg", "-loglevel", "error", *a], check=True)  # noqa: E731
+            # 2 video nen: do + tieng 300 Hz (25 fps), xanh la + tieng 700 Hz (60 fps)
+            for name, color, fps, freq in (("r.mp4", "red", 25, 300), ("g.mp4", "green", 60, 700)):
+                run("-f", "lavfi", "-i", f"color=c={color}:s=480x854:r={fps}:d=6", "-f", "lavfi", "-i",
+                    f"aevalsrc='0.8*sin(2*PI*{freq}*t)':s=48000:d=6", "-shortest", "-c:v", "libx264",
+                    "-preset", "ultrafast", str(d / "bgv" / name))
+            run("-f", "lavfi", "-i", "color=c=blue:s=360x640:r=30:d=10", "-c:v", "libx264", "-preset",
+                "ultrafast", str(d / "src.mp4"))  # video chinh khong co tieng
+            rc = vc.main([str(d / "src.mp4"), "-o", str(d / "out"), "--bg-video-dir", str(d / "bgv"),
+                          "--no-fx", "--no-ghost", "--preset", "superfast", "--seed", "7"])
+            self.assertEqual(rc, 0)
+            (out,) = (d / "out").iterdir()
+            dur = TestEndToEnd._durations(None, out)
+            self.assertAlmostEqual(dur["audio"], dur["video"], delta=0.005)
+            # Mau goc tren-trai (lop nen lo ra) cua tung frame
+            raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(out), "-vf",
+                                  "crop=40:40:10:10,scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                 capture_output=True, check=True).stdout
+            src = ["r" if raw[i] > raw[i + 1] else "g" for i in range(0, len(raw), 3)]
+            pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(out), "-ac", "1", "-ar", "8000",
+                                  "-f", "s16le", "-"], capture_output=True, check=True).stdout
+            a = array("h")
+            a.frombytes(pcm)
+            n_win = len(src) // 60
+            self.assertGreaterEqual(n_win, 3)
+            for w in range(n_win):
+                frames = src[w * 60:(w + 1) * 60]
+                self.assertEqual(len(set(frames)), 1, f"doan {w} lan 2 nguon")  # ca doan cung 1 nguon
+                if w:
+                    self.assertNotEqual(frames[0], src[w * 60 - 1], f"khong cat o doan {w}")
+                mid = a[int((w * 2.002 + 0.5) * 8000):int((w * 2.002 + 1.5) * 8000)]
+                tone = "r" if goertzel(mid, 300, 8000) > goertzel(mid, 700, 8000) else "g"
+                self.assertEqual(tone, frames[0], f"doan {w}: tieng khong cung nguon voi hinh")
 
 
 @unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
