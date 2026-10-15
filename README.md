@@ -13,8 +13,8 @@ Chỉ dùng thư viện chuẩn của Python 3.9+, cần `ffmpeg` và `ffprobe` 
 
 **Cách nhanh nhất (bấm Run trong VS Code hoặc chạy không tham số):** tạo thư mục `input` cạnh file `video_chuan.py`
 và bỏ video vào đó. Kết quả sẽ nằm trong thư mục `output` cạnh script. Nếu chưa có thư mục `input`, script chỉ in hướng dẫn.
-Nếu cạnh script có các thư mục `ambient/` (tiếng môi trường), `background/` (ảnh nền), `hook/` (clip mở đầu)
-hoặc `bgvideo/` (video nền), giao diện tự điền sẵn và bật các tuỳ chọn tương ứng.
+Nếu cạnh script có thư mục `hook/` (clip mở đầu) hoặc `bgvideo/` (video nền), giao diện tự điền sẵn và bật
+các tuỳ chọn tương ứng.
 
 **Chạy trong Terminal:**
 
@@ -61,9 +61,7 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 | `--hook {off,move,copy}` | `off` | Đưa đoạn âm thanh cao trào nhất lên đầu: `move` chuyển hẳn (tổng thời lượng không đổi), `copy` nhân bản (dài thêm đúng độ dài hook) |
 | `--hook-len` | `3` | Độ dài hook (giây) |
 | `--micro-cut` / `--no-micro-cut` | bật | Cắt nhịp: cứ mỗi `--micro-period` (1.2 s) bỏ `--micro-len` (0.1 s), cả hình lẫn tiếng |
-| `--ambient-dir` | | Thư mục âm thanh môi trường: trộn 3 lớp ngẫu nhiên (mỗi lớp 2–3%), thay cho pink noise và nhạc nền |
-| `--bg-dir` / `--bg-scale` | — / `0.85` | Thư mục ảnh nền: 3 ảnh ngẫu nhiên xếp chồng dưới video (độ mờ 100% / 50% / 30%), video thu còn 85% khung |
-| `--bg-video-dir` / `--bg-audio-vol` | — / `0.03` | Thư mục video nền: chọn ngẫu nhiên 1 video đặt dưới video chính (lặp lại, bắt đầu ở vị trí ngẫu nhiên), tiếng của nó trộn 3%. Có video nền thì bỏ qua ảnh nền |
+| `--bg-video-dir` / `--bg-audio-vol` / `--bg-scale` | — / `0.03` / `0.85` | Thư mục video nền: chọn ngẫu nhiên 1 video đặt dưới video chính (lặp lại, bắt đầu ở vị trí ngẫu nhiên), tiếng của nó trộn 3%, video chính thu còn 85% khung |
 | `--hook-dir` / `--intro-trim` | — / `3` | Thư mục clip mở đầu (2–3 s): chọn ngẫu nhiên 1 clip, bỏ 3 s đầu của video gốc và ghép clip vào đầu |
 | `--overlay-4k` / `--overlay-opacity` / `--no-overlay` | tự tạo / `0.06` | Lớp phủ ngà lạnh trên cùng: file texture (ảnh hoặc video), bỏ trống thì tự tạo lớp màu `#EEF1F4` |
 | `--seed` | | Cố định tham số ngẫu nhiên để tái lập |
@@ -85,7 +83,7 @@ thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt th
 → cắt nhịp `select='lte(mod(n*1001,36000),33000)',setpts=N*1001/30000/TB` → `rotate=0.7*PI/180:c=black`
 → zoom gốc 1.23 (±0.02 theo sin, chu kỳ 4–6 s) bằng `scale` theo từng frame → `crop` với toạ độ X/Y = giữa + trôi theo `sin`/`cos`
 (chu kỳ 5–9 s, 60% phần dư ra) + rung nhẹ 3 px mỗi frame, luôn kẹp trong phần dư nên không lộ viền
-→ `boxblur` vùng hardsub của video chính → (nếu có) thu video chính còn 85% và đặt lên video nền / 3 lớp ảnh nền
+→ `boxblur` vùng hardsub của video chính → (nếu có) thu video chính còn 85% và đặt lên video nền
 → `eq=contrast=1.15:brightness=-0.03:saturation=1.08` → `colorbalance=rs=-0.05:gs=0.01:bs=0.08:rh=-0.04:gh=0.02:bh=0.06` + `hue=h=<-4..4>`
 → FX → phụ đề → ghost overlay (`color=c=white@0.015:s=150x150`, toạ độ theo `sin(t*gx)`, `cos(t*gy)`) → lớp phủ ngà lạnh
 → hạt nhiễu `noise=alls=3:allf=t+u` ở tầng cuối cùng.
@@ -98,11 +96,10 @@ thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt th
 **Audio (6 bước):** `asetrate=46967,aresample=44100` → `highpass=f=120,lowpass=f=8000,equalizer=f=1000:width_type=h:width=200:g=2`
 → `acompressor=threshold=-15dB:ratio=4:attack=5:release=50` → `chorus=0.7:0.9:15:0.4:0.25:2`
 → `pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1` → cắt nhịp (`aselect` + `asetpts=N/SR/TB`, làm mềm 6 ms mỗi điểm cắt)
-→ trộn các lớp nền trong một `amix=...:duration=first:normalize=0` (giọng gốc giữ 100%): 3 lớp ambient
-(hoặc `anoisesrc=color=pink:r=44100:a=0.02` + nhạc nền 0.03–0.05 nếu không có `--ambient-dir`) và tiếng video nền 3% (nếu có).
-Các lớp nền fade-out 1.5 s cuối.
+→ trộn các lớp nền trong một `amix=...:duration=first:normalize=0` (giọng gốc giữ 100%): `anoisesrc=color=pink:r=44100:a=0.02`,
+nhạc nền 0.03–0.05 (nếu có `--bgm`) và tiếng video nền 3% (nếu có). Các lớp nền fade-out 1.5 s cuối.
 
-Thứ tự các lớp từ dưới lên: video nền / 3 ảnh nền → video chính (đã zoom, camera, mờ hardsub) → FX → phụ đề → ghost
+Thứ tự các lớp từ dưới lên: video nền (nếu có) → video chính (đã zoom, camera, mờ hardsub) → FX → phụ đề → ghost
 → lớp phủ ngà lạnh → hạt nhiễu.
 
 **Xuất:** `-c:v libx264 -profile:v high -level 4.1 -pix_fmt yuv420p -b:v <5700–6300k> -maxrate 8M -c:a aac -b:a 192k`

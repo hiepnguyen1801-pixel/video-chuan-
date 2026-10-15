@@ -240,33 +240,19 @@ class TestMicroCut(unittest.TestCase):
         self.assertEqual(vc.output_frames(vc.Config(), 20.0), (563, 518))
 
     def test_layers_and_inputs(self):
-        cfg = vc.Config(ambient_files=[Path(f"/amb/{i}.mp3") for i in range(4)],
-                        bg_files=[Path(f"/bg/{i}.jpg") for i in range(5)],
-                        overlay_file=Path("/tex/ivory4k.png"))
+        cfg = vc.Config(overlay_file=Path("/tex/ivory4k.png"))
         p = params(cfg, bgm="bgm.mp3")
-        self.assertIsNone(p.bgm)  # ambient thay BGM
-        self.assertEqual(p.input_keys(), ["amb0", "amb1", "amb2", "bg0", "bg1", "bg2", "tex"])
-        self.assertEqual(len({f for f, _, _ in p.ambient}), 3)  # 3 file khac nhau
-        self.assertTrue(all(0.02 <= v <= 0.03 for _, v, _ in p.ambient))
+        self.assertEqual(p.input_keys(), ["bgm", "tex"])
         g = vc.build_filter_graph(cfg, p, INFO)
-        self.assertIn("[voice][amb0][amb1][amb2]amix=inputs=4:duration=first:normalize=0", g)
-        self.assertNotIn("anoisesrc", g)
-        self.assertIn("[4:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-                      "setsar=1,fps=30000/1001[bgl0]", g)
-        self.assertIn("colorchannelmixer=aa=0.5,fps=30000/1001[bgl1]", g)
-        self.assertIn("colorchannelmixer=aa=0.3,fps=30000/1001[bgl2]", g)
-        self.assertIn("[bgs2][fgv]overlay=(W-w)/2:(H-h)/2,setsar=1,eq=contrast=", g)  # video tren 3 lop nen
-        # zoom/camera va lam mo hardsub ap len video chinh TRUOC khi thu nho va dat len nen
-        self.assertIn("[v3]scale=918:1632:force_original_aspect_ratio=decrease", g)
-        self.assertLess(g.index("crop=1080:1920:'clip("), g.index("[v3]scale=918:1632"))
-        self.assertIn("[7:v]scale=1080:1920", g)  # texture la input 7
-        # thu tu tang: nen -> video -> ... -> lop phu nga lanh -> hat nhieu -> xuat
-        order = [g.index(x) for x in ("[bgs2][fgv]overlay", "[v5][tex]overlay", "noise=alls", "[vout]")]
+        self.assertIn("[voice][noise][bgm]amix=inputs=3:duration=first:normalize=0", g)
+        self.assertIn("[2:v]scale=1080:1920", g)  # texture la input 2
+        # thu tu tang: video -> ... -> lop phu nga lanh -> hat nhieu -> xuat
+        order = [g.index(x) for x in ("crop=1080:1920:'clip(", "[v5][tex]overlay", "noise=alls", "[vout]")]
         self.assertEqual(order, sorted(order))
         cmd = vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4")
         i_args = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
         self.assertEqual(i_args[0], "/in.mp4")
-        self.assertEqual([Path(x).parent.name for x in i_args[1:]], ["amb"] * 3 + ["bg"] * 3 + ["tex"])
+        self.assertEqual([Path(x).name for x in i_args[1:]], ["bgm.mp3", "ivory4k.png"])
 
     def test_cli_options(self):
         cfg = vc.config_from_args(vc.parse_args(["x.mp4", "--no-micro-cut", "--no-overlay"]))
@@ -276,7 +262,10 @@ class TestMicroCut(unittest.TestCase):
         with self.assertRaises(SystemExit):
             vc.config_from_args(vc.parse_args(["x.mp4", "--micro-len", "0.01"]))
         with self.assertRaises(SystemExit):
-            vc.config_from_args(vc.parse_args(["x.mp4", "--ambient-dir", "/khong/co/thu/muc"]))
+            vc.config_from_args(vc.parse_args(["x.mp4", "--overlay-4k", "/khong/co/file.png"]))
+        for removed in ("--ambient-dir", "--bg-dir"):  # 2 tinh nang da bo
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                vc.parse_args(["x.mp4", removed, "/tmp"])
 
 
 class TestIntroAndBgVideo(unittest.TestCase):
@@ -298,11 +287,9 @@ class TestIntroAndBgVideo(unittest.TestCase):
         self.assertEqual(vc.pick_hook(energy, 3.0, 20.0, start=3.0), (10.0, 13.0))
 
     def test_graph_and_command(self):
-        cfg = vc.Config(intro_files=[Path("/x/intro.mp4")], bg_video_files=[Path("/x/bgv.mp4")],
-                        bg_files=[Path("/x/bg.jpg")])
+        cfg = vc.Config(intro_files=[Path("/x/intro.mp4")], bg_video_files=[Path("/x/bgv.mp4")])
         p = self._params(cfg)
         self.assertAlmostEqual(p.src_duration, 17.0 + 2.5)
-        self.assertEqual(p.bg_images, [])  # video nen thay anh nen
         self.assertEqual(p.input_keys(), ["intro", "bgv"])
         g = vc.build_filter_graph(cfg, p, INFO)
         for s in [
@@ -370,15 +357,6 @@ class TestAVSyncAfterMicroCut(unittest.TestCase):
     def test_flash_and_beep_stay_aligned(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            (d / "amb").mkdir()
-            (d / "bg").mkdir()
-            for i in range(3):
-                subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
-                                f"anoisesrc=color=brown:a=0.3:d=4:seed={i}", str(d / "amb" / f"{i}.wav")],
-                               check=True)
-                subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
-                                f"testsrc2=s={640 + i * 64}x480", "-frames:v", "1",
-                                str(d / "bg" / f"{i}.png")], check=True)
             on = "gte(T,0.35)*lt(mod(T-0.35,0.47),0.066)"
             subprocess.run(
                 ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
@@ -387,7 +365,7 @@ class TestAVSyncAfterMicroCut(unittest.TestCase):
                  f"aevalsrc='if({on.replace('T', 't')},0.8*sin(2*PI*1000*t),0)':s=48000:d=8",
                  "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", str(d / "sync.mp4")], check=True)
             rc = vc.main([str(d / "sync.mp4"), "-o", str(d / "out"), "--no-fx", "--preset", "superfast",
-                          "--seed", "2", "--ambient-dir", str(d / "amb"), "--bg-dir", str(d / "bg")])
+                          "--seed", "2"])
             self.assertEqual(rc, 0)
             (out,) = (d / "out").iterdir()
 
