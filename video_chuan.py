@@ -14,6 +14,7 @@ import functools
 import json
 import math
 import os
+import queue
 import random
 import re
 import secrets
@@ -26,6 +27,13 @@ from array import array
 from dataclasses import dataclass, field
 from operator import mul
 from pathlib import Path
+
+try:  # giao dien (khong bat buoc: thieu tkinter thi van chay bang dong lenh)
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
+except ImportError:
+    tk = None
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
@@ -164,6 +172,61 @@ def even(x: float) -> int:
     return int(round(x / 2.0)) * 2
 
 
+class Cancelled(RuntimeError):
+    """Nguoi dung bam Dung."""
+
+
+cancel_event = threading.Event()
+_procs_lock = threading.Lock()
+_procs: set[subprocess.Popen] = set()
+
+
+def run_proc(cmd: list[str], cwd: Path | None = None, binary: bool = False,
+             on_line=None) -> tuple[int, str | bytes, str]:
+    """Chay lenh con (co the huy bang cancel_all). Tra ve (ma thoat, stdout, stderr).
+
+    on_line: neu co, doc stdout tung dong (text) va goi on_line(dong) - dung cho -progress.
+    """
+    if cancel_event.is_set():
+        raise Cancelled("da dung")
+    enc = {} if binary else {"encoding": "utf-8", "errors": "replace"}
+    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, **enc)
+    with _procs_lock:
+        _procs.add(proc)
+    try:
+        if on_line is None:
+            out, err = proc.communicate()
+        else:
+            err_parts: list[str] = []
+            reader = threading.Thread(target=lambda: err_parts.append(proc.stderr.read()), daemon=True)
+            reader.start()
+            for line in proc.stdout:
+                on_line(line)
+            proc.wait()
+            reader.join()
+            out, err = "", "".join(err_parts)
+    finally:
+        with _procs_lock:
+            _procs.discard(proc)
+    if cancel_event.is_set():
+        raise Cancelled("da dung")
+    if binary:
+        err = err.decode("utf-8", "replace")
+    return proc.returncode, out, err
+
+
+def cancel_all() -> None:
+    """Dung moi ffmpeg/ffprobe dang chay; file tam se duoc process_one don dep."""
+    cancel_event.set()
+    with _procs_lock:
+        for proc in list(_procs):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+
 def probe(path: Path) -> MediaInfo:
     cmd = [
         "ffprobe", "-v", "error",
@@ -172,10 +235,10 @@ def probe(path: Path) -> MediaInfo:
         ":stream_tags:stream_side_data=rotation",
         "-of", "json", str(path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffprobe loi: {proc.stderr.strip()}")
-    data = json.loads(proc.stdout or "{}")
+    code, out, err = run_proc(cmd)
+    if code != 0:
+        raise RuntimeError(f"ffprobe loi: {err.strip()}")
+    data = json.loads(out or "{}")
     streams = data.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
     if video is None:
@@ -354,14 +417,13 @@ def analyze_audio(src: Path, cfg: Config, duration: float) -> tuple[list[tuple[f
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-i", str(src), "-map", "0:a:0",
            "-af", f"silencedetect=noise={cfg.silence_db}dB:d={cfg.silence_min}",
            "-ac", "1", "-ar", str(ENERGY_RATE), "-f", "s16le", "pipe:1"]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
-        raise RuntimeError("phan tich audio loi: " + " | ".join(tail))
-    silences = parse_silences(proc.stderr.decode("utf-8", "replace"), duration)
+    code, pcm, err = run_proc(cmd, binary=True)
+    if code != 0:
+        raise RuntimeError("phan tich audio loi: " + " | ".join(err.strip().splitlines()[-3:]))
+    silences = parse_silences(err, duration)
 
     samples = array("h")
-    samples.frombytes(proc.stdout[: len(proc.stdout) // 2 * 2])
+    samples.frombytes(pcm[: len(pcm) // 2 * 2])
     if sys.byteorder == "big":
         samples.byteswap()
     n = int(ENERGY_RATE * ENERGY_BLOCK)
@@ -727,7 +789,9 @@ def find_subs(src: Path, subs_arg: Path | None) -> Path | None:
 
 
 def process_one(src: Path, out_dir: Path, cfg: Config, seed: int, bgm_files: list[Path],
-                subs_arg: Path | None, use_subs: bool, dry_run: bool, keep_temp: bool) -> Result:
+                subs_arg: Path | None, use_subs: bool, dry_run: bool, keep_temp: bool,
+                progress=None) -> Result:
+    """progress: ham nhan ti le 0..1 khi render (dung cho giao dien)."""
     t_start = time.monotonic()
     name = None
     try:
@@ -767,12 +831,23 @@ def process_one(src: Path, out_dir: Path, cfg: Config, seed: int, bgm_files: lis
         if subs_name:
             (out_dir / subs_name).write_text(build_ass(cues, cfg), encoding="utf-8")
         (out_dir / filter_name).write_text(graph, encoding="utf-8")
-        proc = subprocess.run(cmd, cwd=out_dir, capture_output=True, text=True)
-        if proc.returncode != 0:
-            tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
-            raise RuntimeError(f"ffmpeg loi (ma {proc.returncode}):\n{tail}")
+        on_line = None
+        if progress:
+            total = params.src_duration / cfg.speed
+            cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
+
+            def on_line(line: str) -> None:
+                key, _, val = line.strip().partition("=")
+                if key in ("out_time_us", "out_time_ms") and val.isdigit() and total > 0:
+                    progress(min(1.0, int(val) / 1e6 / total))
+        code, _, err = run_proc(cmd, cwd=out_dir, on_line=on_line)
+        if code != 0:
+            tail = "\n".join(err.strip().splitlines()[-8:])
+            raise RuntimeError(f"ffmpeg loi (ma {code}):\n{tail}")
         final = out_dir / f"{name}.mp4"
         (out_dir / part_name).replace(final)
+        if progress:
+            progress(1.0)
         return Result(src, True, final, params, elapsed=time.monotonic() - t_start)
     except Exception as exc:  # noqa: BLE001 - bao loi tung file, khong dung ca lo
         return Result(src, False, error=str(exc), elapsed=time.monotonic() - t_start)
@@ -802,11 +877,30 @@ def cleanup(out_dir: Path, name: str) -> None:
 # CLI
 # --------------------------------------------------------------------------- #
 _print_lock = threading.Lock()
+_log_sink = None  # giao dien thay print bang ham rieng
+
+
+def set_log_sink(fn) -> None:
+    global _log_sink
+    _log_sink = fn
 
 
 def log(msg: str) -> None:
+    if _log_sink is not None:
+        _log_sink(msg)
+        return
     with _print_lock:
         print(msg, flush=True)
+
+
+def format_result(r: Result) -> str:
+    if not r.ok:
+        return f"[LOI] {r.src.name}: {r.error}"
+    p = r.params
+    return (f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
+            f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
+            f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
+            + describe_edit(p.edit))
 
 
 def collect_files(paths: list[str], exts: set[str]) -> list[Path]:
@@ -874,6 +968,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--seed", type=int, help="seed de tai lap tham so ngau nhien")
     ap.add_argument("--dry-run", action="store_true", help="chi in lenh ffmpeg + filter, khong render")
     ap.add_argument("--keep-temp", action="store_true", help="giu lai file tam (de debug)")
+    ap.add_argument("--gui", action="store_true",
+                    help="mo cua so giao dien (mac dinh khi chay khong tham so)")
     return ap.parse_args(argv)
 
 
@@ -943,6 +1039,10 @@ def print_usage_guide(default_in: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
+    if a.gui or not (sys.argv[1:] if argv is None else argv):
+        rc = launch_gui()
+        if rc is not None:
+            return rc
     raw_inputs, out_default = a.inputs, "output"
     if not raw_inputs:
         default_in = SCRIPT_DIR / "input"
@@ -991,14 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def report(r: Result) -> None:
         results.append(r)
-        if r.ok:
-            p = r.params
-            log(f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
-                f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
-                f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
-                + describe_edit(p.edit))
-        else:
-            log(f"[LOI] {r.src.name}: {r.error}")
+        log(format_result(r))
 
     if jobs == 1:
         # Mac dinh: xu ly xong file nay moi sang file tiep theo
@@ -1015,6 +1108,418 @@ def main(argv: list[str] | None = None) -> int:
     log(f"\nHoan tat: {ok}/{len(results)} thanh cong, {len(results) - ok} loi, "
         f"tong thoi gian {time.monotonic() - t0:.1f}s")
     return 0 if ok == len(results) else 1
+
+
+# --------------------------------------------------------------------------- #
+# Giao dien (tkinter): mo khi chay khong tham so (vd. bam Run trong VS Code) hoac voi --gui
+# --------------------------------------------------------------------------- #
+SETTINGS_FILE = Path.home() / ".video_chuan_gui.json"
+
+
+def open_folder(path: Path) -> None:
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif os.name == "nt":
+        os.startfile(str(path))  # noqa: S606 - chi co tren Windows
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def launch_gui() -> int | None:
+    """Mo cua so giao dien. Tra ve None neu may khong mo duoc (de chay che do dong lenh)."""
+    if tk is None:
+        hint = ""
+        if sys.platform == "darwin":
+            hint = (f" Cai them: brew install python-tk@{sys.version_info.major}.{sys.version_info.minor}"
+                    " (hoac cai Python tu python.org).")
+        log("[canh bao] Python nay khong co tkinter nen khong mo duoc giao dien." + hint)
+        return None
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # vd. may khong co man hinh
+        log(f"[canh bao] khong mo duoc giao dien: {exc}")
+        return None
+    GuiApp(root)
+    root.mainloop()
+    return 0
+
+
+class GuiApp:
+    POLL_MS = 100
+
+    def __init__(self, root):
+        self.root = root
+        self.q: queue.Queue = queue.Queue()
+        self.files: list[Path] = []
+        self.running = False
+        self.close_requested = False
+        self.destroyed = False
+        self.frac: dict[int, float] = {}
+        self.names: dict[int, str] = {}
+        self.current = -1
+        self.total = self.done = self.ok = 0
+        self.jobs = 1
+
+        s = self._load_settings()
+        self.out_var = tk.StringVar(value=s.get("output", str(SCRIPT_DIR / "output")))
+        self.flip_var = tk.BooleanVar(value=s.get("flip", False))
+        self.silence_var = tk.BooleanVar(value=s.get("silence_cut", False))
+        self.hook_var = tk.StringVar(value=s.get("hook", "off"))
+        self.subs_var = tk.BooleanVar(value=s.get("subs", True))
+        self.bgm_on_var = tk.BooleanVar(value=s.get("bgm_on", False))
+        self.bgm_var = tk.StringVar(value=s.get("bgm", ""))
+        self.jobs_var = tk.IntVar(value=s.get("jobs", 1))
+        self.fast_var = tk.BooleanVar(value=s.get("fast", False))
+        self.status_var = tk.StringVar(value="Thêm video rồi bấm Bắt đầu.")
+
+        self._build()
+        default_in = SCRIPT_DIR / "input"
+        if default_in.is_dir():
+            self._add_paths(collect_files([str(default_in)], VIDEO_EXTS))
+        set_log_sink(lambda msg: self.q.put(("log", msg)))
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Dua cua so len tren cung (macOS hay mo sau VS Code)
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(300, lambda: root.attributes("-topmost", False))
+        root.after(self.POLL_MS, self._poll)
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            self.start_btn.state(["disabled"])
+            self.status_var.set("Chưa cài ffmpeg - xem hướng dẫn trong khung bên dưới.")
+            self._append_log("Khong tim thay ffmpeg/ffprobe. Cai dat roi mo lai chuong trinh:\n"
+                             "  macOS:   brew install ffmpeg\n"
+                             "  Windows: winget install Gyan.FFmpeg\n"
+                             "  Ubuntu:  sudo apt install ffmpeg")
+
+    # ----- giao dien -----
+    def _build(self):
+        r = self.root
+        r.title("Video Chuẩn")
+        r.minsize(640, 660)
+        bold = tkfont.nametofont("TkDefaultFont").copy()
+        bold.configure(weight="bold")
+        main = ttk.Frame(r, padding=14)
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
+
+        ttk.Label(main, text="1. Video cần xử lý", font=bold).grid(row=0, column=0, sticky="w")
+        lf = ttk.Frame(main)
+        lf.grid(row=1, column=0, sticky="nsew", pady=4)
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+        self.listbox = tk.Listbox(lf, height=7, selectmode="extended", activestyle="none")
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        main.rowconfigure(1, weight=1)
+        bf = ttk.Frame(main)
+        bf.grid(row=2, column=0, sticky="ew")
+        self.edit_btns = [
+            ttk.Button(bf, text="Thêm video…", command=self._pick_files),
+            ttk.Button(bf, text="Thêm cả thư mục…", command=self._pick_dir),
+            ttk.Button(bf, text="Bỏ video đã chọn", command=self._remove_selected),
+            ttk.Button(bf, text="Xoá hết", command=self._clear),
+        ]
+        for i, b in enumerate(self.edit_btns):
+            b.pack(side="left", padx=(0 if i == 0 else 6, 0))
+        self.count_lbl = ttk.Label(bf, text="0 video")
+        self.count_lbl.pack(side="right")
+
+        ttk.Label(main, text="2. Lưu kết quả vào", font=bold).grid(row=3, column=0, sticky="w", pady=(14, 0))
+        of = ttk.Frame(main)
+        of.grid(row=4, column=0, sticky="ew", pady=4)
+        of.columnconfigure(0, weight=1)
+        ttk.Entry(of, textvariable=self.out_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(of, text="Chọn…", command=self._pick_out).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(of, text="Mở thư mục", command=self._open_out).grid(row=0, column=2, padx=(6, 0))
+
+        ttk.Label(main, text="3. Tuỳ chọn", font=bold).grid(row=5, column=0, sticky="w", pady=(14, 0))
+        opt = ttk.Frame(main)
+        opt.grid(row=6, column=0, sticky="ew", pady=4)
+        opt.columnconfigure(1, weight=1)
+        for row, (text, var) in enumerate([
+            ("Lật ngang video", self.flip_var),
+            ("Tự cắt khoảng lặng", self.silence_var),
+            ("Tự chèn phụ đề (file .srt trùng tên, đặt cạnh video)", self.subs_var),
+        ]):
+            ttk.Checkbutton(opt, text=text, variable=var).grid(row=row, column=0, columnspan=3, sticky="w")
+        hf = ttk.Frame(opt)
+        hf.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(hf, text="Hook 3 giây cao trào:").pack(side="left")
+        for val, text in (("off", "Tắt"), ("move", "Chuyển lên đầu"), ("copy", "Nhân bản lên đầu")):
+            ttk.Radiobutton(hf, text=text, value=val, variable=self.hook_var).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(opt, text="Nhạc nền:", variable=self.bgm_on_var).grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(opt, textvariable=self.bgm_var).grid(row=4, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
+        ttk.Button(opt, text="File…", command=self._pick_bgm_file).grid(row=4, column=2, padx=(6, 0), pady=(6, 0))
+        ttk.Button(opt, text="Thư mục…", command=self._pick_bgm_dir).grid(row=4, column=3, padx=(6, 0), pady=(6, 0))
+        jf = ttk.Frame(opt)
+        jf.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(jf, text="Số video chạy cùng lúc:").pack(side="left")
+        ttk.Spinbox(jf, from_=1, to=max(1, os.cpu_count() or 1), width=4, state="readonly",
+                    textvariable=self.jobs_var).pack(side="left", padx=6)
+        ttk.Label(jf, text="(1 = xong video này mới sang video sau)").pack(side="left")
+        ttk.Checkbutton(opt, text="Render nhanh (chất lượng giảm nhẹ)", variable=self.fast_var).grid(
+            row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        rf = ttk.Frame(main)
+        rf.grid(row=7, column=0, sticky="ew", pady=(16, 4))
+        self.start_btn = ttk.Button(rf, text="▶  Bắt đầu", command=self._start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(rf, text="■  Dừng", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+        ttk.Label(main, textvariable=self.status_var).grid(row=8, column=0, sticky="w")
+        self.pbar = ttk.Progressbar(main, maximum=1000)
+        self.pbar.grid(row=9, column=0, sticky="ew", pady=4)
+        tf = ttk.Frame(main)
+        tf.grid(row=10, column=0, sticky="nsew")
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+        main.rowconfigure(10, weight=1)
+        self.logbox = tk.Text(tf, height=8, wrap="word", state="disabled")
+        lsb = ttk.Scrollbar(tf, orient="vertical", command=self.logbox.yview)
+        self.logbox.configure(yscrollcommand=lsb.set)
+        self.logbox.grid(row=0, column=0, sticky="nsew")
+        lsb.grid(row=0, column=1, sticky="ns")
+
+    # ----- danh sach video -----
+    def _add_paths(self, paths):
+        known = {p.resolve() for p in self.files}
+        for p in paths:
+            if p.resolve() not in known:
+                known.add(p.resolve())
+                self.files.append(p)
+                self.listbox.insert("end", f"{p.name}    ({p.parent})")
+        self.count_lbl.configure(text=f"{len(self.files)} video")
+
+    def _pick_files(self):
+        pats = " ".join(f"*{e} *{e.upper()}" for e in sorted(VIDEO_EXTS))
+        names = filedialog.askopenfilenames(parent=self.root, title="Chọn video",
+                                            filetypes=[("Video", pats), ("Tất cả", "*")])
+        self._add_paths([Path(n) for n in names])
+
+    def _pick_dir(self):
+        d = filedialog.askdirectory(parent=self.root, title="Chọn thư mục chứa video")
+        if not d:
+            return
+        found = collect_files([d], VIDEO_EXTS)
+        if not found:
+            messagebox.showinfo("Video Chuẩn", "Thư mục này không có video nào.", parent=self.root)
+        self._add_paths(found)
+
+    def _remove_selected(self):
+        for i in reversed(self.listbox.curselection()):
+            self.listbox.delete(i)
+            del self.files[i]
+        self.count_lbl.configure(text=f"{len(self.files)} video")
+
+    def _clear(self):
+        self.listbox.delete(0, "end")
+        self.files.clear()
+        self.count_lbl.configure(text="0 video")
+
+    def _pick_out(self):
+        d = filedialog.askdirectory(parent=self.root, title="Chọn thư mục lưu kết quả")
+        if d:
+            self.out_var.set(d)
+
+    def _open_out(self):
+        out = Path(self.out_var.get()).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        open_folder(out)
+
+    def _pick_bgm_file(self):
+        pats = " ".join(f"*{e} *{e.upper()}" for e in sorted(AUDIO_EXTS))
+        n = filedialog.askopenfilename(parent=self.root, title="Chọn nhạc nền",
+                                       filetypes=[("Âm thanh", pats), ("Tất cả", "*")])
+        if n:
+            self.bgm_var.set(n)
+            self.bgm_on_var.set(True)
+
+    def _pick_bgm_dir(self):
+        d = filedialog.askdirectory(parent=self.root, title="Chọn thư mục nhạc nền")
+        if d:
+            self.bgm_var.set(d)
+            self.bgm_on_var.set(True)
+
+    # ----- chay -----
+    def _start(self):
+        if not self.files:
+            messagebox.showinfo("Video Chuẩn", "Chưa có video nào. Bấm 'Thêm video…' để chọn.",
+                                parent=self.root)
+            return
+        bgm_files: list[Path] = []
+        if self.bgm_on_var.get():
+            raw = self.bgm_var.get().strip()
+            bgm_files = collect_files([str(Path(raw).expanduser())], AUDIO_EXTS) if raw else []
+            if not bgm_files:
+                messagebox.showwarning("Video Chuẩn", "Không tìm thấy file nhạc nền. Chọn lại, "
+                                       "hoặc bỏ tích 'Nhạc nền'.", parent=self.root)
+                return
+        out = Path(self.out_var.get().strip() or SCRIPT_DIR / "output").expanduser()
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Video Chuẩn", f"Không tạo được thư mục lưu kết quả:\n{exc}",
+                                 parent=self.root)
+            return
+        argv = ["-o", str(out), "--hook", self.hook_var.get(),
+                "--preset", "veryfast" if self.fast_var.get() else "medium"]
+        if self.flip_var.get():
+            argv.append("--flip")
+        if self.silence_var.get():
+            argv.append("--silence-cut")
+        cfg = config_from_args(parse_args(argv))
+        self.jobs = max(1, int(self.jobs_var.get()))
+        if self.jobs > 1:
+            cfg.threads = max(1, (os.cpu_count() or 1) // self.jobs)
+        self._save_settings()
+
+        files = list(self.files)
+        self.total, self.done, self.ok, self.current = len(files), 0, 0, -1
+        self.frac = {i: 0.0 for i in range(len(files))}
+        self.names = {i: f.name for i, f in enumerate(files)}
+        self.running = True
+        self.start_btn.state(["disabled"])
+        self.stop_btn.state(["!disabled"])
+        for b in self.edit_btns:
+            b.state(["disabled"])
+        self.logbox.configure(state="normal")
+        self.logbox.delete("1.0", "end")
+        self.logbox.configure(state="disabled")
+        self._append_log(f"Bat dau: {len(files)} video -> {out.resolve()}")
+        cancel_event.clear()
+        threading.Thread(target=self._worker, daemon=True,
+                         args=(files, out.resolve(), cfg, bgm_files, self.subs_var.get())).start()
+
+    def _worker(self, files, out_dir, cfg, bgm_files, use_subs):
+        rnd = random.SystemRandom()
+
+        def one(i: int, src: Path) -> None:
+            if cancel_event.is_set():
+                return
+            self.q.put(("start", i))
+            r = process_one(src, out_dir, cfg, rnd.randrange(2**32), bgm_files, None, use_subs,
+                            False, False, progress=lambda f: self.q.put(("progress", i, f)))
+            self.q.put(("done", i, r))
+
+        try:
+            if self.jobs == 1:
+                for i, src in enumerate(files):
+                    one(i, src)
+            else:
+                with cf.ThreadPoolExecutor(max_workers=self.jobs) as pool:
+                    list(pool.map(lambda a: one(*a), enumerate(files)))
+        except Exception as exc:  # noqa: BLE001 - khong de luong nen chet im lang
+            self.q.put(("log", f"[LOI] {exc}"))
+        finally:
+            self.q.put(("finished",))
+
+    def _stop(self):
+        if self.running:
+            cancel_all()
+            self.stop_btn.state(["disabled"])
+            self.status_var.set("Đang dừng…")
+
+    def _poll(self):
+        try:
+            self._drain_queue()
+        finally:
+            if not self.destroyed:
+                self.root.after(self.POLL_MS, self._poll)
+
+    def _drain_queue(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    self._append_log(item[1])
+                elif kind == "start":
+                    self.current = item[1]
+                elif kind == "progress":
+                    self.frac[item[1]] = item[2]
+                elif kind == "done":
+                    r = item[2]
+                    self.frac[item[1]] = 1.0
+                    self.done += 1
+                    self.ok += r.ok
+                    if not (cancel_event.is_set() and not r.ok):
+                        self._append_log(format_result(r))
+                elif kind == "finished":
+                    self._finish()
+                    if self.destroyed:
+                        return
+        except queue.Empty:
+            pass
+        if self.running and self.total and not cancel_event.is_set():
+            overall = sum(self.frac.values()) / self.total
+            self.pbar["value"] = overall * 1000
+            if self.jobs == 1 and self.current >= 0:
+                self.status_var.set(f"Đang xử lý {self.current + 1}/{self.total}: "
+                                    f"{self.names[self.current]} - {self.frac[self.current] * 100:.0f}%")
+            else:
+                self.status_var.set(f"Đã xong {self.done}/{self.total} video - {overall * 100:.0f}%")
+
+    def _finish(self):
+        self.running = False
+        if self.close_requested:
+            self.destroyed = True
+            self.root.destroy()
+            return
+        self.start_btn.state(["!disabled"])
+        self.stop_btn.state(["disabled"])
+        for b in self.edit_btns:
+            b.state(["!disabled"])
+        if cancel_event.is_set():
+            self.status_var.set(f"Đã dừng. Xong {self.ok}/{self.total} video.")
+            self._append_log(f"Da dung. Xong {self.ok}/{self.total} video.")
+            return
+        self.pbar["value"] = 1000
+        self.status_var.set(f"Hoàn tất: {self.ok}/{self.total} video thành công.")
+        self._append_log(f"Hoan tat: {self.ok}/{self.total} video thanh cong.")
+        if self.ok and messagebox.askyesno(
+                "Video Chuẩn", f"Xong {self.ok}/{self.total} video.\nMở thư mục kết quả?", parent=self.root):
+            self._open_out()
+
+    def _on_close(self):
+        if not self.running:
+            self.root.destroy()
+            return
+        if messagebox.askyesno("Video Chuẩn", "Đang xử lý video. Dừng lại và thoát?", parent=self.root):
+            self.close_requested = True
+            cancel_all()
+            self.root.after(8000, self._force_close)  # phong khi luong nen khong ket thuc
+
+    def _force_close(self):
+        if not self.destroyed:
+            self.destroyed = True
+            self.root.destroy()
+
+    def _append_log(self, msg: str):
+        self.logbox.configure(state="normal")
+        self.logbox.insert("end", msg + "\n")
+        self.logbox.see("end")
+        self.logbox.configure(state="disabled")
+
+    # ----- luu tuy chon cho lan sau -----
+    @staticmethod
+    def _load_settings() -> dict:
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_settings(self) -> None:
+        data = {"output": self.out_var.get(), "flip": self.flip_var.get(),
+                "silence_cut": self.silence_var.get(), "hook": self.hook_var.get(),
+                "subs": self.subs_var.get(), "bgm_on": self.bgm_on_var.get(),
+                "bgm": self.bgm_var.get(), "jobs": int(self.jobs_var.get()), "fast": self.fast_var.get()}
+        try:
+            SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
