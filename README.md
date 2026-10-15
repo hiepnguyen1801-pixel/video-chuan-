@@ -3,7 +3,18 @@
 Script Python (`video_chuan.py`) xử lý video 9:16 hàng loạt bằng ffmpeg: xuất 1080×1920, 29.97 FPS, H.264 High@4.1 + AAC 192k.
 Chỉ dùng thư viện chuẩn của Python 3.9+, cần `ffmpeg` và `ffprobe` (có libx264, libass) trong PATH.
 
+## Cài đặt
+
+- macOS: `brew install ffmpeg` · Windows: `winget install Gyan.FFmpeg` · Ubuntu: `sudo apt install ffmpeg`
+- Đã kiểm tra với ffmpeg 6.1, 7.0, 8.1 và 9.0. Từ ffmpeg 7 trở lên, script dùng `-/filter_complex <file>`
+  (ffmpeg 9 đã bỏ `-filter_complex_script`), với ffmpeg 6 trở xuống thì dùng `-filter_complex_script`.
+
 ## Cách dùng
+
+**Cách nhanh nhất (bấm Run trong VS Code hoặc chạy không tham số):** tạo thư mục `input` cạnh file `video_chuan.py`
+và bỏ video vào đó. Kết quả sẽ nằm trong thư mục `output` cạnh script. Nếu chưa có thư mục `input`, script chỉ in hướng dẫn.
+
+**Chạy trong Terminal:**
 
 ```bash
 # Xử lý cả thư mục, 4 file song song, lật ngang, nhạc nền chọn ngẫu nhiên từ thư mục nhac/

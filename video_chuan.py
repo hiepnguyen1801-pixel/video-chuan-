@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import functools
 import json
 import math
 import os
@@ -658,6 +659,26 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
     return ";\n".join(g) + "\n"
 
 
+@functools.lru_cache(maxsize=1)
+def ffmpeg_major() -> int:
+    """Phien ban chinh cua ffmpeg trong PATH (ban build tu git 'N-xxxxx' coi nhu ban moi nhat)."""
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-version"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return 0
+    m = re.search(r"ffmpeg version n?(\d+)\.", out)
+    return int(m.group(1)) if m else 99
+
+
+def filter_script_args(filter_file: str) -> list[str]:
+    # ffmpeg >= 7 doc filter tu file bang "-/filter_complex"; ffmpeg 9 da bo "-filter_complex_script",
+    # con ffmpeg <= 6 chi hieu "-filter_complex_script".
+    if ffmpeg_major() >= 7:
+        return ["-/filter_complex", filter_file]
+    return ["-filter_complex_script", filter_file]
+
+
 def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
            "-i", str(src)]
@@ -667,7 +688,7 @@ def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file
     if p.bgm:
         cmd += ["-stream_loop", "-1", "-i", str(p.bgm.resolve())]
     cmd += [
-        "-filter_complex_script", filter_file,
+        *filter_script_args(filter_file),
         # Khong dung -shortest: audio/video da duoc ep cung so frame trong filter graph,
         # -shortest cua ffmpeg cat theo packet nen hay lam mat 1 frame cuoi.
         "-map", "[vout]", "-map", "[aout]",
@@ -804,8 +825,11 @@ def collect_files(paths: list[str], exts: set[str]) -> list[Path]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Xu ly video 9:16 (1080x1920, 29.97 FPS) hang loat bang ffmpeg.")
-    ap.add_argument("inputs", nargs="+", help="file video hoac thu muc chua video")
-    ap.add_argument("-o", "--output-dir", default="output", help="thu muc xuat (mac dinh: output)")
+    ap.add_argument("inputs", nargs="*",
+                    help="file video hoac thu muc chua video (bo trong: dung thu muc 'input' canh script)")
+    ap.add_argument("-o", "--output-dir",
+                    help="thu muc xuat (mac dinh: output; khi dung thu muc 'input' canh script "
+                         "thi la 'output' canh script)")
     ap.add_argument("-j", "--jobs", type=int, default=1, help="so file xu ly song song (mac dinh: 1)")
     ap.add_argument("--flip", action="store_true", help="lat ngang video (hflip)")
     ap.add_argument("--speed", type=float, default=1.065, help="toc do phat (mac dinh: 1.065)")
@@ -899,18 +923,44 @@ def config_from_args(a: argparse.Namespace) -> Config:
     return cfg
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def print_usage_guide(default_in: Path) -> None:
+    log(
+        "Chua chon video nao de xu ly.\n\n"
+        "Cach 1 - chay trong Terminal, truyen file hoac thu muc video:\n"
+        "    python3 video_chuan.py <file_hoac_thu_muc_video> [-o thu_muc_xuat] [-j 4] [--flip] ...\n"
+        "  Vi du:\n"
+        "    python3 video_chuan.py ~/Downloads/video_goc -o ~/Downloads/video_xuat -j 4\n\n"
+        "Cach 2 - bam Run (VS Code) / chay khong tham so:\n"
+        f"    bo video vao thu muc: {default_in}\n"
+        f"    ket qua se nam trong: {default_in.parent / 'output'}\n\n"
+        "Xem tat ca tuy chon: python3 video_chuan.py --help"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
+    raw_inputs, out_default = a.inputs, "output"
+    if not raw_inputs:
+        default_in = SCRIPT_DIR / "input"
+        if not (default_in.is_dir() and collect_files([str(default_in)], VIDEO_EXTS)):
+            print_usage_guide(default_in)
+            return 0  # chi in huong dan, khong phai loi
+        raw_inputs, out_default = [str(default_in)], str(SCRIPT_DIR / "output")
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            log(f"[loi] khong tim thay {tool} trong PATH")
+            log(f"[loi] khong tim thay {tool} trong PATH. "
+                "Cai dat: macOS 'brew install ffmpeg', Windows 'winget install Gyan.FFmpeg', "
+                "Ubuntu 'sudo apt install ffmpeg'")
             return 2
     cfg = config_from_args(a)
     jobs = max(1, a.jobs)
     if jobs > 1:
         cfg.threads = max(1, (os.cpu_count() or 1) // jobs)
 
-    inputs = collect_files(a.inputs, VIDEO_EXTS)
+    inputs = collect_files(raw_inputs, VIDEO_EXTS)
     if not inputs:
         log("[loi] khong co file video nao de xu ly")
         return 2
@@ -922,7 +972,7 @@ def main(argv: list[str] | None = None) -> int:
     if subs_arg and subs_arg.is_file() and len(inputs) > 1:
         log("[canh bao] --subs la 1 file nhung co nhieu video: phu de se dung cho moi video")
 
-    out_dir = Path(a.output_dir)
+    out_dir = Path(a.output_dir or out_default).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_dir = out_dir.resolve()
 
