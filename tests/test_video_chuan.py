@@ -15,8 +15,9 @@ HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 INFO = vc.MediaInfo(duration=20.0, width=1080, height=1920, has_audio=True)
 
 
-def params(cfg, seed=1, bgm=None):
-    return vc.make_params(cfg, INFO, random.Random(seed), "a1b2c3d4", [Path(bgm)] if bgm else [])
+def params(cfg, seed=1, bgm=None, edit=None, info=INFO):
+    dur = edit.duration if edit else info.duration
+    return vc.make_params(cfg, dur, random.Random(seed), "a1b2c3d4", [Path(bgm)] if bgm else [], edit)
 
 
 class TestSubtitles(unittest.TestCase):
@@ -77,6 +78,7 @@ class TestFilterGraph(unittest.TestCase):
         for s in [
             "setpts=(PTS-STARTPTS)/1.065",
             "select='not(eq(mod(n\\,145)\\,0))',fps=30000/1001",
+            "tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame=563",  # round(20/1.065*29.97) = round(562.8)
             "hflip,rotate=0.7*PI/180:c=black",
             "eq=saturation=1.12:contrast=1.04:brightness=-0.02",
             f"hue=h={p.hue}",
@@ -95,7 +97,8 @@ class TestFilterGraph(unittest.TestCase):
             "anoisesrc=color=pink:r=44100:a=0.02",
             "[voice][noise]amix=inputs=2",
             f"volume={p.bgm_volume}",
-            "afade=t=out:st=17.279:d=1.5",  # 20/1.065 - 1.5
+            "afade=t=out:st=17.285:d=1.5",  # 563 frame = 18.785s - 1.5
+            "apad=whole_dur=18.785,atrim=duration=18.785[aout]",
             "[vout]", "[aout]",
         ]:
             self.assertIn(s, g)
@@ -109,7 +112,7 @@ class TestFilterGraph(unittest.TestCase):
     def test_no_audio_uses_silence(self):
         cfg = vc.Config()
         info = vc.MediaInfo(10.0, 1280, 720, has_audio=False)
-        g = vc.build_filter_graph(cfg, params(cfg), info)
+        g = vc.build_filter_graph(cfg, params(cfg, info=info), info)
         self.assertNotIn("[0:a", g)
         self.assertIn("anullsrc", g)
         self.assertIn("[bg0]", g)  # video ngang -> fit=auto chon nen mo
@@ -126,8 +129,96 @@ class TestFilterGraph(unittest.TestCase):
             self.assertIn(s, cmd)
 
 
+class TestSilenceAndHook(unittest.TestCase):
+    LOG = ("[silencedetect @ 0x1] silence_start: -0.01\n"
+           "[silencedetect @ 0x1] silence_end: 0.8 | silence_duration: 0.81\n"
+           "[silencedetect @ 0x1] silence_start: 4\n"
+           "[silencedetect @ 0x1] silence_end: 5.5 | silence_duration: 1.5\n"
+           "[silencedetect @ 0x1] silence_start: 9.2\n")
+
+    def test_parse_silences(self):
+        self.assertEqual(vc.parse_silences(self.LOG, 10.0), [(0.0, 0.8), (4.0, 5.5), (9.2, 10.0)])
+
+    def test_keep_segments(self):
+        segs = vc.keep_segments(vc.parse_silences(self.LOG, 10.0), 10.0, pad=0.15)
+        # dau/cuoi file cat sach phia ngoai, giua file chua lai 0.15s moi ben
+        self.assertEqual(segs, [(0.0 + 0.65, 4.15), (5.35, 9.35)])
+
+    def test_pick_hook(self):
+        energy = [1.0] * 100
+        energy[60:70] = [50.0] * 10   # 6.0-7.0s to nhat
+        energy[0:30] = [999.0] * 30   # phan mo dau khong duoc chon
+        self.assertEqual(vc.pick_hook(energy, 3.0, 10.0), (4.0, 7.0))
+        self.assertIsNone(vc.pick_hook([1.0] * 50, 3.0, 5.0))  # video qua ngan
+
+    def _edit(self, mode):
+        cfg = vc.Config(silence_cut=True, hook_mode=mode)
+        energy = [1.0] * 100
+        energy[60:90] = [50.0] * 30  # 6.0-9.0s to nhat
+        return vc.build_edit(cfg, 10.0, vc.parse_silences(self.LOG, 10.0), energy)
+
+    def test_build_edit_move(self):
+        e = self._edit("move")
+        self.assertEqual(e.hook, (6.0, 9.0))
+        self.assertEqual(e.segments, [(0.65, 4.15), (5.35, 6.0), (9.0, 9.35)])
+        self.assertEqual(e.cuts, 3)
+        self.assertAlmostEqual(e.duration, 10.0 - e.cut_seconds)  # move khong doi tong thoi luong
+
+    def test_build_edit_copy(self):
+        e = self._edit("copy")
+        self.assertEqual(e.segments, [(0.65, 4.15), (5.35, 9.35)])
+        self.assertAlmostEqual(e.duration, 10.0 - e.cut_seconds + 3.0)
+
+    def test_remap_cues(self):
+        cues = [(0.0, 1.0, "a"), (6.5, 7.0, "hook")]
+        out = vc.remap_cues(cues, [(6.0, 9.0), (0.65, 4.15)])
+        self.assertEqual([(round(s, 2), round(e, 2), t) for s, e, t in out],
+                         [(0.5, 1.0, "hook"), (3.0, 3.35, "a")])
+
+    def test_filter_and_command_with_hook(self):
+        cfg = vc.Config(silence_cut=True, hook_mode="move")
+        p = params(cfg, bgm="bgm.mp3", edit=self._edit("move"))
+        self.assertEqual(p.inputs(), (1, 2))
+        g = vc.build_filter_graph(cfg, p, INFO)
+        self.assertIn("select='between(t,0.650,4.150)+between(t,5.350,6.000)+between(t,9.000,9.350)'", g)
+        self.assertIn("setpts='PTS-(0.6500*gte(T,0.650)+1.2000*gte(T,5.350)+3.0000*gte(T,9.000))/TB'", g)
+        self.assertIn("asplit=3[ms0][ms1][ms2]", g)
+        self.assertIn("[hv][ha][mv][ma]concat=n=2:v=1:a=1[vsrc][asrc]", g)
+        self.assertIn("[vsrc]setpts=(PTS-STARTPTS)/1.065", g)
+        self.assertIn("[asrc]asetpts", g)
+        self.assertIn("[2:a:0]aresample", g)  # bgm la input thu 3
+        cmd = " ".join(vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4"))
+        self.assertIn("-i /in.mp4 -ss 6.000 -t 3.000 -i /in.mp4 -stream_loop -1", cmd)
+
+
 @unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
 class TestEndToEnd(unittest.TestCase):
+    def _durations(self, path):
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+                              "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+        return {s["codec_type"]: float(s["duration"]) for s in json.loads(out)["streams"]}
+
+    def test_silence_cut_hook_and_av_length(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            src = d / "talk.mp4"
+            # audio dai hon video 0.8s; lang 2-3.5s; to nhat 4.5-6.5s
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=360x640:r=30:d=8",
+                 "-f", "lavfi", "-i",
+                 "aevalsrc='if(between(t,2,3.5),0,if(between(t,4.5,6.5),0.9,0.15))*sin(2*PI*300*t)'"
+                 ":s=48000:d=8.8",
+                 "-c:v", "libx264", "-preset", "ultrafast", str(src)], check=True)
+            for mode, expect in (("move", 8 - 1.2), ("copy", 8 - 1.2 + 3)):
+                out = d / mode
+                rc = vc.main([str(src), "-o", str(out), "--silence-cut", "--hook", mode,
+                              "--preset", "superfast", "--seed", "1"])
+                self.assertEqual(rc, 0)
+                (f,) = out.iterdir()
+                dur = self._durations(f)
+                self.assertAlmostEqual(dur["video"], expect / 1.065, delta=0.05)
+                self.assertAlmostEqual(dur["audio"], dur["video"], delta=0.005)  # khong dung hinh cuoi clip
+
     def test_batch_parallel(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)

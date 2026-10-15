@@ -41,9 +41,24 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 | `--bitrate MIN MAX` | `5.7 6.3` | Target bitrate ngẫu nhiên (Mbps) |
 | `--maxrate` | `8` | Maxrate (Mbps), bufsize = 2× maxrate |
 | `--preset` | `medium` | Preset libx264 (`ultrafast` sẽ ra Baseline, không phải High) |
+| `--silence-cut` | tắt | Tự dò (`silencedetect`) và cắt khoảng lặng |
+| `--silence-db` / `--silence-min` / `--silence-pad` | `-35` / `0.5` / `0.15` | Ngưỡng lặng (dB), độ dài lặng tối thiểu để cắt (s), phần giữ lại mỗi bên (s) |
+| `--hook {off,move,copy}` | `off` | Đưa đoạn âm thanh cao trào nhất lên đầu: `move` chuyển hẳn (tổng thời lượng không đổi), `copy` nhân bản (dài thêm đúng độ dài hook) |
+| `--hook-len` | `3` | Độ dài hook (giây) |
 | `--seed` | | Cố định tham số ngẫu nhiên để tái lập |
 
 ## Pipeline
+
+**Silence Cut + Energy Hook** (bật bằng `--silence-cut`, `--hook move|copy`): đọc audio 1 lần, vừa chạy
+`silencedetect=noise=-35dB:d=0.5` vừa lấy PCM để đo năng lượng theo từng khối 0.1 s. Khoảng lặng bị cắt (chừa 0.15 s mỗi bên),
+cửa sổ 3 s có năng lượng cao nhất (không tính 3 s mở đầu) được đưa lên đầu video. Video cắt bằng `select` + `setpts`,
+audio cắt bằng `atrim` + `concat` (chính xác tới từng mẫu), hook lấy từ input thứ 2 (`-ss/-t`) rồi ghép bằng `concat`.
+Phụ đề `.srt` được dời thời gian theo đúng các đoạn cắt/hook.
+
+**Đồng bộ hình/tiếng:** thời lượng xuất được làm tròn theo số frame 29.97. Video được ép đúng số frame đó
+(`tpad` lặp frame cuối nếu thiếu, `trim=end_frame` nếu thừa, đặt trước zoom/grain nên không bị đứng hình),
+audio được `apad` + `atrim=duration` về cùng độ dài. Thời lượng gốc lấy theo luồng video, nên nếu audio gốc dài hơn hình
+thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt theo packet và hay làm mất frame cuối.
 
 **Video:** `setpts` (speed) → `select='not(eq(mod(n\,145)\,0))'` → `fps=30000/1001` → đưa về 1080×1920 → `hflip` (tuỳ chọn)
 → `rotate=0.7*PI/180:c=black` → `eq=saturation=1.12:contrast=1.04:brightness=-0.02` + `hue=h=<-4..4>`
@@ -68,6 +83,8 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 - **asetrate:** 44100 × 1.065 = 46966.5 (không phải 46973), script làm tròn thành 46967 và luôn tính theo `--speed`.
   Audio được `aresample=44100` *trước* `asetrate`, nếu không file gốc 48 kHz sẽ bị chậm lại thay vì nhanh hơn.
 - **29.97 FPS** dùng giá trị chuẩn `30000/1001`.
+- **Drop frame:** `select='not(eq(mod(n\,145)\,0))'` bỏ cả frame số 0. Vì vậy `fps` được đặt `start_time=0`,
+  frame đầu được bù bằng cách lặp lại, tránh để hình chạy sớm hơn tiếng 1 frame.
 - **amix** dùng `normalize=0`, nếu không ffmpeg sẽ chia đôi âm lượng giọng nói khi trộn nhiễu.
 - Video không có tiếng vẫn có track audio (nhiễu nền + nhạc nền).
 

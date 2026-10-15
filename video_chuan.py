@@ -21,7 +21,9 @@ import subprocess
 import sys
 import threading
 import time
+from array import array
 from dataclasses import dataclass, field
+from operator import mul
 from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
@@ -36,6 +38,11 @@ FX_TYPES = ("flash", "punch", "glitch")
 FLASH_DUR, FLASH_BRIGHTNESS = 0.12, 0.07
 GLITCH_DUR, GLITCH_SHIFT = 0.15, 6
 PUNCH_ZOOM, PUNCH_SIGMA = 0.03, 0.08
+
+# Phan tich am thanh (silence cut / energy hook)
+ENERGY_RATE = 8000   # Hz, PCM mono dung de do nang luong
+ENERGY_BLOCK = 0.1   # giay moi block nang luong
+AFMT = f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo"
 
 
 # --------------------------------------------------------------------------- #
@@ -74,6 +81,12 @@ class Config:
     audio_bitrate: str = "192k"
     preset: str = "medium"
     threads: int = 0  # 0 = de ffmpeg tu chon
+    silence_cut: bool = False
+    silence_db: float = -35.0
+    silence_min: float = 0.5
+    silence_pad: float = 0.15
+    hook_mode: str = "off"  # off | move | copy
+    hook_len: float = 3.0
 
     @property
     def fast_rate(self) -> int:
@@ -90,6 +103,24 @@ class MediaInfo:
 
 
 @dataclass
+class Edit:
+    """Danh sach doan giu lai (thoi gian goc, theo thu tu). Hook (neu co) dat len dau video."""
+    segments: list[tuple[float, float]]
+    hook: tuple[float, float] | None = None
+    hook_mode: str = "off"
+    cuts: int = 0          # so khoang lang da cat
+    cut_seconds: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        hook = self.hook[1] - self.hook[0] if self.hook else 0.0
+        return sum(b - a for a, b in self.segments) + hook
+
+    def output_order(self) -> list[tuple[float, float]]:
+        return ([self.hook] if self.hook else []) + self.segments
+
+
+@dataclass
 class Params:
     """Cac tham so ngau nhien rieng cho tung file."""
     name: str
@@ -102,6 +133,17 @@ class Params:
     fx_events: list[tuple[float, str]] = field(default_factory=list)
     bgm: Path | None = None
     bgm_volume: float = 0.0
+    edit: Edit | None = None
+    src_duration: float = 0.0  # thoi luong (giay) sau cat lang/hook, truoc khi tang toc
+
+    def inputs(self) -> tuple[int | None, int | None]:
+        """Chi so input ffmpeg cua (hook, bgm). Input 0 luon la video goc."""
+        idx, hook, bgm = 1, None, None
+        if self.edit and self.edit.hook:
+            hook, idx = idx, idx + 1
+        if self.bgm:
+            bgm = idx
+        return hook, bgm
 
 
 @dataclass
@@ -126,7 +168,7 @@ def probe(path: Path) -> MediaInfo:
         "ffprobe", "-v", "error",
         "-show_entries",
         "format=duration:stream=codec_type,width,height,duration"
-        ":stream_tags=rotate:stream_side_data=rotation",
+        ":stream_tags:stream_side_data=rotation",
         "-of", "json", str(path),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -148,11 +190,28 @@ def probe(path: Path) -> MediaInfo:
     if abs(rotation) % 180 == 90:  # ffmpeg tu xoay khi decode -> doi chieu
         width, height = height, width
 
-    duration = data.get("format", {}).get("duration") or video.get("duration")
-    if not duration or float(duration) <= 0:
+    # Uu tien thoi luong cua luong VIDEO: neu audio goc dai hon video thi khong duoc keo dai theo audio
+    duration = _num(video.get("duration")) or _tag_duration(video.get("tags", {})) \
+        or _num(data.get("format", {}).get("duration"))
+    if not duration:
         raise RuntimeError("khong doc duoc thoi luong video")
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    return MediaInfo(float(duration), width, height, has_audio)
+    return MediaInfo(duration, width, height, has_audio)
+
+
+def _num(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if v > 0 and math.isfinite(v) else 0.0
+
+
+def _tag_duration(tags: dict) -> float:
+    """Tag DURATION cua mkv/webm, dang HH:MM:SS.nnnnnnnnn."""
+    raw = next((v for k, v in tags.items() if k.upper() == "DURATION"), "")
+    m = re.match(r"(\d+):(\d+):(\d+(?:\.\d+)?)", str(raw))
+    return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 0.0
 
 
 _name_lock = threading.Lock()
@@ -267,10 +326,12 @@ def fx_schedule(duration: float, interval: tuple[float, float] | None,
     return events
 
 
-def make_params(cfg: Config, info: MediaInfo, rng: random.Random, name: str,
-                bgm_files: list[Path]) -> Params:
-    out_duration = info.duration / cfg.speed
+def make_params(cfg: Config, src_duration: float, rng: random.Random, name: str,
+                bgm_files: list[Path], edit: Edit | None = None) -> Params:
+    out_duration = src_duration / cfg.speed
     return Params(
+        edit=edit,
+        src_duration=src_duration,
         name=name,
         hue=round(rng.uniform(-cfg.hue_range, cfg.hue_range), 2),
         zoom_period=round(rng.uniform(*cfg.zoom_period), 3),
@@ -282,6 +343,159 @@ def make_params(cfg: Config, info: MediaInfo, rng: random.Random, name: str,
         bgm=rng.choice(bgm_files) if bgm_files else None,
         bgm_volume=round(rng.uniform(*cfg.bgm_volume), 4) if bgm_files else 0.0,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Silence Cut + Energy Hook
+# --------------------------------------------------------------------------- #
+def analyze_audio(src: Path, cfg: Config, duration: float) -> tuple[list[tuple[float, float]], list[float]]:
+    """1 lan doc audio: silencedetect (log stderr) + PCM mono 8 kHz (stdout) de do nang luong."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-i", str(src), "-map", "0:a:0",
+           "-af", f"silencedetect=noise={cfg.silence_db}dB:d={cfg.silence_min}",
+           "-ac", "1", "-ar", str(ENERGY_RATE), "-f", "s16le", "pipe:1"]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise RuntimeError("phan tich audio loi: " + " | ".join(tail))
+    silences = parse_silences(proc.stderr.decode("utf-8", "replace"), duration)
+
+    samples = array("h")
+    samples.frombytes(proc.stdout[: len(proc.stdout) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    n = int(ENERGY_RATE * ENERGY_BLOCK)
+    energy = []
+    for i in range(0, len(samples) - n + 1, n):
+        chunk = samples[i:i + n]
+        energy.append(sum(map(mul, chunk, chunk)) / n)
+    return silences, energy
+
+
+def parse_silences(text: str, duration: float) -> list[tuple[float, float]]:
+    out, start = [], None
+    for m in re.finditer(r"silence_(start|end): (-?[\d.]+)", text):
+        val = min(max(0.0, float(m.group(2))), duration)
+        if m.group(1) == "start":
+            start = val
+        elif start is not None:
+            out.append((start, val))
+            start = None
+    if start is not None and start < duration:  # lang den het file
+        out.append((start, duration))
+    return out
+
+
+def keep_segments(silences, duration: float, pad: float, min_seg: float = 0.05) -> list[tuple[float, float]]:
+    """Cac doan co tieng (bo khoang lang, chua lai `pad` giay o moi ben de khong cut cut chu)."""
+    segs, cur = [], 0.0
+    for s, e in sorted(silences):
+        cs = 0.0 if s <= 0 else s + pad
+        ce = duration if e >= duration else e - pad
+        if ce - cs <= 0:
+            continue
+        if cs - cur >= min_seg:
+            segs.append((round(cur, 3), round(cs, 3)))
+        cur = max(cur, ce)
+    if duration - cur >= min_seg:
+        segs.append((round(cur, 3), round(duration, 3)))
+    return segs
+
+
+def subtract_range(segs, rng: tuple[float, float], min_seg: float = 0.05) -> list[tuple[float, float]]:
+    h0, h1 = rng
+    out = []
+    for a, b in segs:
+        for x, y in ((a, min(b, h0)), (max(a, h1), b)):
+            if y - x >= min_seg:
+                out.append((x, y))
+    return out
+
+
+def pick_hook(energy: list[float], hook_len: float, duration: float) -> tuple[float, float] | None:
+    """Cua so `hook_len` giay co nang luong (RMS^2) cao nhat, khong trung voi phan mo dau."""
+    w = max(1, round(hook_len / ENERGY_BLOCK))
+    first = w  # bat dau tu giay thu hook_len tro di
+    if len(energy) < first + w:
+        return None
+    cur = sum(energy[first:first + w])
+    best, best_i = cur, first
+    for i in range(first + 1, len(energy) - w + 1):
+        cur += energy[i + w - 1] - energy[i - 1]
+        if cur > best:
+            best, best_i = cur, i
+    if best <= 0:
+        return None
+    start = round(best_i * ENERGY_BLOCK, 3)
+    return start, round(min(start + hook_len, duration), 3)
+
+
+def build_edit(cfg: Config, duration: float, silences, energy) -> Edit | None:
+    segs = [(0.0, round(duration, 3))]
+    cuts, cut_seconds = 0, 0.0
+    if cfg.silence_cut:
+        kept = keep_segments(silences, duration, cfg.silence_pad)
+        kept_len = sum(b - a for a, b in kept)
+        if kept and kept_len >= 1.0 and kept != segs:  # khong cat neu gan nhu toan bo la khoang lang
+            bounds = [0.0] + [x for seg in kept for x in seg] + [duration]
+            cuts = sum(1 for i in range(0, len(bounds), 2) if bounds[i + 1] - bounds[i] > 1e-3)
+            cut_seconds = round(duration - kept_len, 3)
+            segs = kept
+    hook = None
+    if cfg.hook_mode in ("move", "copy"):
+        hook = pick_hook(energy, cfg.hook_len, duration)
+        if hook and cfg.hook_mode == "move":
+            segs = subtract_range(segs, hook)
+    if hook is None and segs == [(0.0, round(duration, 3))]:
+        return None
+    return Edit(segs, hook, cfg.hook_mode if hook else "off", cuts, cut_seconds)
+
+
+def remap_cues(cues, order: list[tuple[float, float]]) -> list[tuple[float, float, str]]:
+    """Doi thoi gian phu de tu video goc sang timeline sau khi cat lang/chen hook."""
+    out, pos = [], 0.0
+    for a, b in order:
+        for s, e, text in cues:
+            s2, e2 = max(s, a), min(e, b)
+            if e2 - s2 > 0.05:
+                out.append((pos + s2 - a, pos + e2 - a, text))
+        pos += b - a
+    return sorted(out)
+
+
+def source_stage(info: MediaInfo, p: Params) -> tuple[list[str], str, str | None]:
+    """Filter cat lang + chen hook. Tra ve (cac dong filter, nhan video, nhan audio)."""
+    edit = p.edit
+    if edit is None:
+        return [], "0:v", "0:a:0" if info.has_audio else None
+    g, segs = [], edit.segments
+    # Video: giu frame trong cac doan, roi doi PTS de noi cac doan lien nhau
+    sel = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in segs)
+    steps, prev, pos = [], 0.0, 0.0
+    for a, b in segs:
+        off = a - pos  # tong thoi gian da cat truoc doan nay
+        if off - prev > 1e-6:
+            steps.append(f"{off - prev:.4f}*gte(T,{a:.3f})")
+        prev, pos = off, pos + (b - a)
+    shift = f",setpts='PTS-({'+'.join(steps)})/TB'" if steps else ""
+    g.append(f"[0:v]setpts=PTS-STARTPTS,select='{sel}'{shift}[mv]")
+    # Audio: atrim tung doan (chinh xac den tung mau) roi concat
+    a_in = f"[0:a:0]asetpts=PTS-STARTPTS,{AFMT}"
+    if len(segs) == 1:
+        a, b = segs[0]
+        g.append(f"{a_in},atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[ma]")
+    else:
+        g.append(f"{a_in},asplit={len(segs)}" + "".join(f"[ms{i}]" for i in range(len(segs))))
+        for i, (a, b) in enumerate(segs):
+            g.append(f"[ms{i}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[mt{i}]")
+        g.append("".join(f"[mt{i}]" for i in range(len(segs))) + f"concat=n={len(segs)}:v=0:a=1[ma]")
+    if not edit.hook:
+        return g, "mv", "ma"
+    # Hook: input rieng (-ss/-t) de khong phai dem frame trong bo nho, dat len dau bang concat
+    hook_idx, _ = p.inputs()
+    g.append(f"[{hook_idx}:v]setpts=PTS-STARTPTS[hv]")
+    g.append(f"[{hook_idx}:a:0]asetpts=PTS-STARTPTS,{AFMT}[ha]")
+    g.append("[hv][ha][mv][ma]concat=n=2:v=1:a=1[vsrc][asrc]")
+    return g, "vsrc", "asrc"
 
 
 # --------------------------------------------------------------------------- #
@@ -312,14 +526,22 @@ def resolve_fit(cfg: Config, info: MediaInfo) -> str:
 def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
                        subs_file: str | None = None) -> str:
     W, H = cfg.width, cfg.height
-    out_dur = info.duration / cfg.speed
-    g: list[str] = []
+    # Lam tron thoi luong xuat theo so frame 29.97 -> video va audio duoc ep ve cung 1 do dai
+    frames = max(1, round((p.src_duration or info.duration) / cfg.speed * 30000 / 1001))
+    out_dur = frames * 1001 / 30000
+    _, bgm_idx = p.inputs()
+
+    # 0) Silence cut + hook (neu bat)
+    g, v_in, a_in = source_stage(info, p)
 
     # 1) Speed + Drop Frame (select dat truoc fps) + co dinh 29.97 FPS
     g.append(
-        f"[0:v]setpts=(PTS-STARTPTS)/{cfg.speed},"
+        f"[{v_in}]setpts=(PTS-STARTPTS)/{cfg.speed},"
         f"select='not(eq(mod(n\\,{cfg.drop_every})\\,0))',"
-        f"fps={FPS}[v0]"
+        f"fps={FPS}:start_time=0,"  # neo moc 0: frame 0 bi select bo se duoc bu, khong lech A/V
+        # Ep video dung `frames` frame: thieu (do drop/cat doan) thi lap frame cuoi (<1 frame), du thi cat.
+        # Dat truoc zoom/grain nen frame lap van chuyen dong, khong bi dung hinh.
+        f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame={frames}[v0]"
     )
 
     # 2) Dua ve khung 9:16 1080x1920
@@ -401,10 +623,9 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
     g.append(f"[{last}]format=yuv420p[vout]")
 
     # ---------------- Audio: 6 buoc ----------------
-    if info.has_audio:
+    if a_in:
         g.append(
-            "[0:a:0]asetpts=PTS-STARTPTS,"
-            f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"[{a_in}]asetpts=PTS-STARTPTS,{AFMT},"
             # B1: speed & pitch
             f"asetrate={cfg.fast_rate},aresample={SAMPLE_RATE},"
             # B2: voice EQ
@@ -426,23 +647,29 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
     if p.bgm:
         fade_st = max(0.0, out_dur - cfg.bgm_fade)
         g.append(
-            f"[1:a:0]aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"[{bgm_idx}:a:0]{AFMT},"
             f"volume={p.bgm_volume},atrim=end={out_dur:.3f},asetpts=PTS-STARTPTS,"
             f"afade=t=out:st={fade_st:.3f}:d={cfg.bgm_fade}[bgm]"
         )
         g.append("[vn][bgm]amix=inputs=2:duration=first:normalize=0[vm]")
         last_a = "vm"
-    g.append(f"[{last_a}]apad=whole_dur={out_dur:.3f},atrim=end={out_dur:.3f}[aout]")
+    # Ep audio dung bang thoi luong video xuat ra (thieu thi pad im lang, du thi cat)
+    g.append(f"[{last_a}]apad=whole_dur={out_dur:.3f},atrim=duration={out_dur:.3f}[aout]")
     return ";\n".join(g) + "\n"
 
 
 def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
            "-i", str(src)]
+    if p.edit and p.edit.hook:  # input thu 2: doan hook cat san bang -ss/-t
+        h0, h1 = p.edit.hook
+        cmd += ["-ss", f"{h0:.3f}", "-t", f"{h1 - h0:.3f}", "-i", str(src)]
     if p.bgm:
         cmd += ["-stream_loop", "-1", "-i", str(p.bgm.resolve())]
     cmd += [
         "-filter_complex_script", filter_file,
+        # Khong dung -shortest: audio/video da duoc ep cung so frame trong filter graph,
+        # -shortest cua ffmpeg cat theo packet nen hay lam mat 1 frame cuoi.
         "-map", "[vout]", "-map", "[aout]",
         # Codec
         "-c:v", "libx264", "-preset", cfg.preset,
@@ -484,9 +711,17 @@ def process_one(src: Path, out_dir: Path, cfg: Config, seed: int, bgm_files: lis
     name = None
     try:
         info = probe(src)
+        edit = None
+        if cfg.silence_cut or cfg.hook_mode != "off":
+            if info.has_audio:
+                silences, energy = analyze_audio(src, cfg, info.duration)
+                edit = build_edit(cfg, info.duration, silences, energy)
+            else:
+                log(f"[canh bao] {src.name}: khong co audio, bo qua silence cut / hook")
         rng = random.Random(seed)
         name = unique_name(out_dir)
-        params = make_params(cfg, info, rng, name, bgm_files)
+        params = make_params(cfg, edit.duration if edit else info.duration, rng, name,
+                             bgm_files, edit)
 
         subs_name = None
         cues = []
@@ -494,6 +729,8 @@ def process_one(src: Path, out_dir: Path, cfg: Config, seed: int, bgm_files: lis
             subs_path = find_subs(src, subs_arg)
             if subs_path:
                 cues = parse_srt(subs_path.read_text(encoding="utf-8", errors="replace"))
+                if edit:
+                    cues = remap_cues(cues, edit.output_order())
                 if cues:
                     subs_name = f"{name}.subs.ass"
 
@@ -521,6 +758,15 @@ def process_one(src: Path, out_dir: Path, cfg: Config, seed: int, bgm_files: lis
     finally:
         if name and not dry_run and not keep_temp:
             cleanup(out_dir, name)
+
+
+def describe_edit(edit: Edit | None) -> str:
+    if edit is None:
+        return ""
+    s = f" | cat_lang={edit.cuts} ({edit.cut_seconds}s)" if edit.cuts else ""
+    if edit.hook:
+        s += f" | hook={edit.hook[0]}-{edit.hook[1]}s ({edit.hook_mode})"
+    return s
 
 
 def cleanup(out_dir: Path, name: str) -> None:
@@ -588,6 +834,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="target bitrate ngau nhien, Mbps (mac dinh: 5.7 6.3)")
     ap.add_argument("--maxrate", type=float, default=8.0, help="maxrate, Mbps (mac dinh: 8)")
     ap.add_argument("--preset", default="medium", help="preset libx264 (mac dinh: medium)")
+    ap.add_argument("--silence-cut", action="store_true",
+                    help="tu dong do (silencedetect) va cat khoang lang")
+    ap.add_argument("--silence-db", type=float, default=-35.0,
+                    help="nguong khoang lang, dB (mac dinh: -35)")
+    ap.add_argument("--silence-min", type=float, default=0.5,
+                    help="khoang lang toi thieu de cat, giay (mac dinh: 0.5)")
+    ap.add_argument("--silence-pad", type=float, default=0.15,
+                    help="giu lai moi ben khoang lang, giay (mac dinh: 0.15)")
+    ap.add_argument("--hook", choices=["off", "move", "copy"], default="off",
+                    help="dua doan am thanh cao trao nhat len dau: move=chuyen (cat khoi cho cu), "
+                         "copy=nhan ban (mac dinh: off)")
+    ap.add_argument("--hook-len", type=float, default=3.0, help="do dai hook, giay (mac dinh: 3)")
     ap.add_argument("--seed", type=int, help="seed de tai lap tham so ngau nhien")
     ap.add_argument("--dry-run", action="store_true", help="chi in lenh ffmpeg + filter, khong render")
     ap.add_argument("--keep-temp", action="store_true", help="giu lai file tam (de debug)")
@@ -621,7 +879,15 @@ def config_from_args(a: argparse.Namespace) -> Config:
         bitrate_mbps=rng_pair(a.bitrate, "--bitrate"),
         maxrate_mbps=a.maxrate,
         preset=a.preset,
+        silence_cut=a.silence_cut,
+        silence_db=a.silence_db,
+        silence_min=max(0.05, a.silence_min),
+        silence_pad=max(0.0, a.silence_pad),
+        hook_mode=a.hook,
+        hook_len=a.hook_len,
     )
+    if cfg.hook_mode != "off" and cfg.hook_len <= 0:
+        raise SystemExit("--hook-len phai > 0")
     if cfg.preset == "ultrafast":
         log("[canh bao] preset ultrafast tat CABAC/B-frame -> x264 xuat Constrained Baseline, "
             "khong phai High profile")
@@ -679,7 +945,8 @@ def main(argv: list[str] | None = None) -> int:
                 p = r.params
                 log(f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
                     f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
-                    f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else ""))
+                    f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
+                    + describe_edit(p.edit))
             else:
                 log(f"[LOI] {r.src.name}: {r.error}")
 
