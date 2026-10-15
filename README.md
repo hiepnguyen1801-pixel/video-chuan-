@@ -17,8 +17,8 @@ và bỏ video vào đó. Kết quả sẽ nằm trong thư mục `output` cạn
 **Chạy trong Terminal:**
 
 ```bash
-# Xử lý cả thư mục, 4 file song song, lật ngang, nhạc nền chọn ngẫu nhiên từ thư mục nhac/
-python3 video_chuan.py input/ -o output/ -j 4 --flip --bgm nhac/
+# Xử lý cả thư mục (lần lượt từng video), lật ngang, nhạc nền chọn ngẫu nhiên từ thư mục nhac/
+python3 video_chuan.py input/ -o output/ --flip --bgm nhac/
 
 # Xem lệnh ffmpeg + filter graph mà không render
 python3 video_chuan.py clip.mp4 --dry-run
@@ -35,7 +35,7 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
 | `-o, --output-dir` | `output` | Thư mục xuất |
-| `-j, --jobs` | `1` | Số file xử lý song song |
+| `-j, --jobs` | `1` | Số video xử lý cùng lúc (mặc định `1` = xong video này mới sang video tiếp theo) |
 | `--flip` | tắt | Lật ngang (`hflip`) |
 | `--speed` | `1.065` | Tốc độ phát (video `setpts`, audio `asetrate`) |
 | `--zoom MIN MAX` | `1.04 1.08` | Khoảng dynamic zoom |

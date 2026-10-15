@@ -830,7 +830,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("-o", "--output-dir",
                     help="thu muc xuat (mac dinh: output; khi dung thu muc 'input' canh script "
                          "thi la 'output' canh script)")
-    ap.add_argument("-j", "--jobs", type=int, default=1, help="so file xu ly song song (mac dinh: 1)")
+    ap.add_argument("-j", "--jobs", type=int, default=1,
+                    help="so file xu ly cung luc (mac dinh: 1 = lan luot tung file)")
     ap.add_argument("--flip", action="store_true", help="lat ngang video (hflip)")
     ap.add_argument("--speed", type=float, default=1.065, help="toc do phat (mac dinh: 1.065)")
     ap.add_argument("--zoom", type=float, nargs=2, metavar=("MIN", "MAX"), default=[1.04, 1.08],
@@ -979,26 +980,36 @@ def main(argv: list[str] | None = None) -> int:
     master = random.Random(a.seed) if a.seed is not None else random.SystemRandom()
     seeds = [master.randrange(2**32) for _ in inputs]
 
-    log(f"Xu ly {len(inputs)} file, {jobs} tien trinh song song -> {out_dir}")
+    mode = "lan luot tung file" if jobs == 1 else f"{jobs} file song song"
+    log(f"Xu ly {len(inputs)} file ({mode}) -> {out_dir}")
     t0 = time.monotonic()
     results: list[Result] = []
-    with cf.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futs = {
-            pool.submit(process_one, src, out_dir, cfg, seed, bgm_files, subs_arg,
-                        not a.no_subs, a.dry_run, a.keep_temp): src
-            for src, seed in zip(inputs, seeds)
-        }
-        for fut in cf.as_completed(futs):
-            r = fut.result()
-            results.append(r)
-            if r.ok:
-                p = r.params
-                log(f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
-                    f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
-                    f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
-                    + describe_edit(p.edit))
-            else:
-                log(f"[LOI] {r.src.name}: {r.error}")
+
+    def run(src: Path, seed: int) -> Result:
+        return process_one(src, out_dir, cfg, seed, bgm_files, subs_arg,
+                           not a.no_subs, a.dry_run, a.keep_temp)
+
+    def report(r: Result) -> None:
+        results.append(r)
+        if r.ok:
+            p = r.params
+            log(f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
+                f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
+                f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
+                + describe_edit(p.edit))
+        else:
+            log(f"[LOI] {r.src.name}: {r.error}")
+
+    if jobs == 1:
+        # Mac dinh: xu ly xong file nay moi sang file tiep theo
+        for i, (src, seed) in enumerate(zip(inputs, seeds), 1):
+            log(f"[{i}/{len(inputs)}] Dang xu ly: {src.name} ...")
+            report(run(src, seed))
+    else:
+        with cf.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = [pool.submit(run, src, seed) for src, seed in zip(inputs, seeds)]
+            for fut in cf.as_completed(futs):
+                report(fut.result())
 
     ok = sum(r.ok for r in results)
     log(f"\nHoan tat: {ok}/{len(results)} thanh cong, {len(results) - ok} loi, "
