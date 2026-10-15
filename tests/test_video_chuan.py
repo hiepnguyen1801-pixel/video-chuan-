@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from array import array
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,7 +33,7 @@ class TestSubtitles(unittest.TestCase):
         self.assertEqual(cues[0][2], "Xin <i>chao</i> {x}\ndong 2")
 
     def test_ass_scaled_by_speed_and_in_safe_zone(self):
-        cfg = vc.Config()
+        cfg = vc.Config(micro_cut=False)
         ass = vc.build_ass(vc.parse_srt(self.SRT), cfg)
         self.assertIn("PlayResX: 1080", ass)
         self.assertIn("PlayResY: 1920", ass)
@@ -80,7 +81,8 @@ class TestFilterGraph(unittest.TestCase):
             "select='not(eq(mod(n\\,145)\\,0))',fps=30000/1001",
             "tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame=563",  # round(20/1.065*29.97) = round(562.8)
             "hflip,rotate=0.7*PI/180:c=black",
-            "eq=saturation=1.12:contrast=1.04:brightness=-0.02",
+            "eq=contrast=1.18:brightness=-0.04:saturation=1.12,"
+            "colorbalance=rs=-0.06:gs=0.01:bs=0.10:rh=-0.05:gh=0.02:bh=0.08,",
             f"hue=h={p.hue}",
             f"1.06000+0.02000*sin(2*PI*t/{p.zoom_period}+{p.zoom_phase})",
             ":eval=frame,crop=1080:1920:",
@@ -97,8 +99,14 @@ class TestFilterGraph(unittest.TestCase):
             "anoisesrc=color=pink:r=44100:a=0.02",
             "[voice][noise]amix=inputs=2",
             f"volume={p.bgm_volume}",
-            "afade=t=out:st=17.285:d=1.5",  # 563 frame = 18.785s - 1.5
-            "apad=whole_dur=18.785,atrim=duration=18.785[aout]",
+            # cat nhip: 563 frame -> giu 518 frame = 17.284s
+            "trim=end_frame=563,select='lte(mod(n*1001,36000),33000)',setpts=N*1001/30000/TB[v0]",
+            "asetnsamples=n=32:p=0,volume=eval=frame:volume='st(0,floor(t*30000/36000));",
+            "aselect='lte(mod(floor(t*30000/1001+1e-9)*1001,36000),33000)',asetpts=N/SR/TB",
+            "afade=t=out:st=15.784:d=1.5",
+            "apad=whole_dur=17.284,atrim=duration=17.284[aout]",
+            "[v6][tex]overlay=0:0",  # lop phu nga lanh sau grain = tren cung
+            "color=c=0xEEF1F4:s=1080x1920",
             "[vout]", "[aout]",
         ]:
             self.assertIn(s, g)
@@ -178,7 +186,8 @@ class TestSilenceAndHook(unittest.TestCase):
     def test_filter_and_command_with_hook(self):
         cfg = vc.Config(silence_cut=True, hook_mode="move")
         p = params(cfg, bgm="bgm.mp3", edit=self._edit("move"))
-        self.assertEqual(p.inputs(), (1, 2))
+        self.assertEqual(p.input_keys(), ["hook", "bgm"])
+        self.assertEqual((p.idx("hook"), p.idx("bgm")), (1, 2))
         g = vc.build_filter_graph(cfg, p, INFO)
         self.assertIn("select='between(t,0.650,4.150)+between(t,5.350,6.000)+between(t,9.000,9.350)'", g)
         self.assertIn("setpts='PTS-(0.6500*gte(T,0.650)+1.2000*gte(T,5.350)+3.0000*gte(T,9.000))/TB'", g)
@@ -189,6 +198,129 @@ class TestSilenceAndHook(unittest.TestCase):
         self.assertIn("[2:a:0]aresample", g)  # bgm la input thu 3
         cmd = " ".join(vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4"))
         self.assertIn("-i /in.mp4 -ss 6.000 -t 3.000 -i /in.mp4 -stream_loop -1", cmd)
+
+
+class TestMicroCut(unittest.TestCase):
+    def test_pattern_first_cycle(self):
+        mc = vc.MicroCut(1.2, 0.1)
+        removed = [k for k in range(40) if not mc.keep(k)]
+        self.assertEqual(removed, [33, 34, 35])  # 1.101s, 1.135s, 1.168s nam trong (1.1, 1.2]
+        self.assertEqual(mc.kept_before(36), 33)
+        self.assertAlmostEqual(mc.kept_before(36000) / 36000, 11 / 12, places=3)
+
+    def test_map_time(self):
+        mc = vc.MicroCut(1.2, 0.1)
+        self.assertAlmostEqual(mc.map_time(0.5), 0.5, places=6)
+        self.assertAlmostEqual(mc.map_time(1.15), 33 * 1001 / 30000)  # trong doan bi bo -> cho noi
+        self.assertAlmostEqual(mc.map_time(1.3), 1.3 - 3 * 1001 / 30000, places=6)
+
+    def test_audio_follows_video_frames(self):
+        # Mau audio thuoc frame video nao thi giu/bo theo dung frame do
+        mc = vc.MicroCut(1.2, 0.1)
+        for i in range(0, 44100 * 5, 7):
+            t = i / 44100
+            k = int(t * 30000 / 1001 + 1e-9)
+            keep_audio = (k * 1001) % mc.P <= mc.C
+            self.assertEqual(keep_audio, mc.keep(k))
+
+    def test_output_frames(self):
+        self.assertEqual(vc.output_frames(vc.Config(micro_cut=False), 20.0), (563, 563))
+        self.assertEqual(vc.output_frames(vc.Config(), 20.0), (563, 518))
+
+    def test_layers_and_inputs(self):
+        cfg = vc.Config(ambient_files=[Path(f"/amb/{i}.mp3") for i in range(4)],
+                        bg_files=[Path(f"/bg/{i}.jpg") for i in range(5)],
+                        overlay_file=Path("/tex/ivory4k.png"))
+        p = params(cfg, bgm="bgm.mp3")
+        self.assertIsNone(p.bgm)  # ambient thay BGM
+        self.assertEqual(p.input_keys(), ["amb0", "amb1", "amb2", "bg0", "bg1", "bg2", "tex"])
+        self.assertEqual(len({f for f, _, _ in p.ambient}), 3)  # 3 file khac nhau
+        self.assertTrue(all(0.02 <= v <= 0.03 for _, v, _ in p.ambient))
+        g = vc.build_filter_graph(cfg, p, INFO)
+        self.assertIn("[voice][amb0][amb1][amb2]amix=inputs=4:duration=first:normalize=0", g)
+        self.assertNotIn("anoisesrc", g)
+        self.assertIn("[4:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+                      "setsar=1,fps=30000/1001[bgl0]", g)
+        self.assertIn("colorchannelmixer=aa=0.5,fps=30000/1001[bgl1]", g)
+        self.assertIn("colorchannelmixer=aa=0.3,fps=30000/1001[bgl2]", g)
+        self.assertIn("[bgs2][fgv]overlay=(W-w)/2:(H-h)/2", g)  # video nam tren 3 lop nen
+        self.assertIn("[v0]scale=918:1632:force_original_aspect_ratio=decrease", g)
+        self.assertIn("[7:v]scale=1080:1920", g)  # texture la input 7
+        # thu tu tang: nen -> video -> ... -> grain -> lop phu nga lanh -> xuat
+        order = [g.index(x) for x in ("[bgs2][fgv]overlay", "blend=all_mode", "[v6][tex]overlay", "[vout]")]
+        self.assertEqual(order, sorted(order))
+        cmd = vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4")
+        i_args = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+        self.assertEqual(i_args[0], "/in.mp4")
+        self.assertEqual([Path(x).parent.name for x in i_args[1:]], ["amb"] * 3 + ["bg"] * 3 + ["tex"])
+
+    def test_cli_options(self):
+        cfg = vc.config_from_args(vc.parse_args(["x.mp4", "--no-micro-cut", "--no-overlay"]))
+        self.assertFalse(cfg.micro_cut)
+        self.assertFalse(cfg.overlay_on)
+        self.assertTrue(vc.config_from_args(vc.parse_args(["x.mp4"])).micro_cut)
+        with self.assertRaises(SystemExit):
+            vc.config_from_args(vc.parse_args(["x.mp4", "--micro-len", "0.01"]))
+        with self.assertRaises(SystemExit):
+            vc.config_from_args(vc.parse_args(["x.mp4", "--ambient-dir", "/khong/co/thu/muc"]))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
+class TestAVSyncAfterMicroCut(unittest.TestCase):
+    """Chop trang va tieng bip phat cung luc o video goc phai van trung nhau sau khi xu ly."""
+
+    def test_flash_and_beep_stay_aligned(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "amb").mkdir()
+            (d / "bg").mkdir()
+            for i in range(3):
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                                f"anoisesrc=color=brown:a=0.3:d=4:seed={i}", str(d / "amb" / f"{i}.wav")],
+                               check=True)
+                subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                                f"testsrc2=s={640 + i * 64}x480", "-frames:v", "1",
+                                str(d / "bg" / f"{i}.png")], check=True)
+            on = "gte(T,0.35)*lt(mod(T-0.35,0.47),0.066)"
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 f"color=c=black:s=320x568:r=30:d=8,format=gray,geq=lum='if({on},235,16)',format=yuv420p",
+                 "-f", "lavfi", "-i",
+                 f"aevalsrc='if({on.replace('T', 't')},0.8*sin(2*PI*1000*t),0)':s=48000:d=8",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", str(d / "sync.mp4")], check=True)
+            rc = vc.main([str(d / "sync.mp4"), "-o", str(d / "out"), "--no-fx", "--preset", "superfast",
+                          "--seed", "2", "--ambient-dir", str(d / "amb"), "--bg-dir", str(d / "bg")])
+            self.assertEqual(rc, 0)
+            (out,) = (d / "out").iterdir()
+
+            # Video: do sang vung giua (luon la video chinh) tung frame
+            raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(out), "-vf",
+                                  "crop=200:200:(iw-200)/2:(ih-200)/2,scale=4:4,format=gray",
+                                  "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+            lum = [sum(raw[i:i + 16]) / 16 for i in range(0, len(raw), 16)]
+            fps = 30000 / 1001
+            flashes = [i / fps for i, v in enumerate(lum) if v > 128 and (i == 0 or lum[i - 1] <= 128)]
+
+            # Audio: diem bat dau tieng bip
+            pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(out), "-ac", "1", "-ar", "8000",
+                                  "-f", "s16le", "-"], capture_output=True, check=True).stdout
+            a = array("h")
+            a.frombytes(pcm)
+            beeps, quiet = [], 10**9
+            for i, x in enumerate(a):
+                if abs(x) > 0.08 * 32767:
+                    if quiet > 400:  # im lang > 50ms truoc do -> tieng bip moi
+                        beeps.append(i / 8000)
+                    quiet = 0
+                else:
+                    quiet += 1
+
+            self.assertGreaterEqual(len(flashes), 12)
+            self.assertEqual(len(flashes), len(beeps), (flashes, beeps))
+            worst = max(abs(f - b) for f, b in zip(flashes, beeps))
+            self.assertLess(worst, 0.05, list(zip(flashes, beeps)))  # < 1.5 frame, khong troi theo thoi gian
+            dur = TestEndToEnd._durations(None, out)
+            self.assertAlmostEqual(dur["audio"], dur["video"], delta=0.005)
 
 
 @unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
@@ -216,7 +348,8 @@ class TestEndToEnd(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 (f,) = out.iterdir()
                 dur = self._durations(f)
-                self.assertAlmostEqual(dur["video"], expect / 1.065, delta=0.05)
+                frames = vc.output_frames(vc.Config(), expect)[1]
+                self.assertAlmostEqual(dur["video"], frames * 1001 / 30000, delta=0.05)
                 self.assertAlmostEqual(dur["audio"], dur["video"], delta=0.005)  # khong dung hinh cuoi clip
 
     def test_batch_parallel(self):
@@ -248,7 +381,8 @@ class TestEndToEnd(unittest.TestCase):
                                  ("h264", "High", 1080, 1920))
                 self.assertEqual(v["r_frame_rate"], "30000/1001")
                 self.assertEqual((a["codec_name"], a["sample_rate"], a["channels"]), ("aac", "44100", 2))
-                self.assertAlmostEqual(float(info["format"]["duration"]), 3 / 1.065, delta=0.1)
+                expect = vc.output_frames(vc.Config(), 3.0)[1] * 1001 / 30000
+                self.assertAlmostEqual(float(info["format"]["duration"]), expect, delta=0.05)
                 self.assertNotIn("title", info["format"].get("tags", {}))
 
 

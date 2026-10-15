@@ -56,6 +56,10 @@ và đặt trong safe zone 880×1420 (lề trái/phải 100 px, lề dưới 250
 | `--silence-db` / `--silence-min` / `--silence-pad` | `-35` / `0.5` / `0.15` | Ngưỡng lặng (dB), độ dài lặng tối thiểu để cắt (s), phần giữ lại mỗi bên (s) |
 | `--hook {off,move,copy}` | `off` | Đưa đoạn âm thanh cao trào nhất lên đầu: `move` chuyển hẳn (tổng thời lượng không đổi), `copy` nhân bản (dài thêm đúng độ dài hook) |
 | `--hook-len` | `3` | Độ dài hook (giây) |
+| `--micro-cut` / `--no-micro-cut` | bật | Cắt nhịp: cứ mỗi `--micro-period` (1.2 s) bỏ `--micro-len` (0.1 s), cả hình lẫn tiếng |
+| `--ambient-dir` | | Thư mục âm thanh môi trường: trộn 3 lớp ngẫu nhiên (mỗi lớp 2–3%), thay cho pink noise và nhạc nền |
+| `--bg-dir` / `--bg-scale` | — / `0.85` | Thư mục ảnh nền: 3 ảnh ngẫu nhiên xếp chồng dưới video (độ mờ 100% / 50% / 30%), video thu còn 85% khung |
+| `--overlay-4k` / `--overlay-opacity` / `--no-overlay` | tự tạo / `0.06` | Lớp phủ ngà lạnh trên cùng: file texture (ảnh hoặc video), bỏ trống thì tự tạo lớp màu `#EEF1F4` |
 | `--seed` | | Cố định tham số ngẫu nhiên để tái lập |
 
 ## Pipeline
@@ -72,7 +76,8 @@ audio được `apad` + `atrim=duration` về cùng độ dài. Thời lượng 
 thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt theo packet và hay làm mất frame cuối.
 
 **Video:** `setpts` (speed) → `select='not(eq(mod(n\,145)\,0))'` → `fps=30000/1001` → đưa về 1080×1920 → `hflip` (tuỳ chọn)
-→ `rotate=0.7*PI/180:c=black` → `eq=saturation=1.12:contrast=1.04:brightness=-0.02` + `hue=h=<-4..4>`
+→ cắt nhịp `select='lte(mod(n*1001,36000),33000)',setpts=N*1001/30000/TB` → 3 lớp ảnh nền (nếu có) → `rotate=0.7*PI/180:c=black`
+→ `eq=contrast=1.18:brightness=-0.04:saturation=1.12` → `colorbalance=rs=-0.06:gs=0.01:bs=0.10:rh=-0.05:gh=0.02:bh=0.08` + `hue=h=<-4..4>`
 → dynamic zoom `z = z_mid + z_amp·sin(2πt/period + phase)` (period 4–6 s) bằng `scale` theo từng frame + crop giữa
 → `boxblur` vùng hardsub → FX → phụ đề → ghost overlay (`color=c=white@0.015:s=150x150`, toạ độ theo `sin(t*gx)`, `cos(t*gy)`)
 → nhiễu hạt (`blend` chế độ overlay, opacity 0.045).
@@ -81,7 +86,12 @@ thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt th
 
 **Audio (6 bước):** `asetrate=46967,aresample=44100` → `highpass=f=120,lowpass=f=8000,equalizer=f=1000:width_type=h:width=200:g=2`
 → `acompressor=threshold=-15dB:ratio=4:attack=5:release=50` → `chorus=0.7:0.9:15:0.4:0.25:2`
-→ `pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1` → trộn `anoisesrc=color=pink:r=44100:a=0.02` + nhạc nền (âm lượng 0.03–0.05, fade-out 1.5 s cuối).
+→ `pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1` → cắt nhịp (`aselect` + `asetpts=N/SR/TB`, làm mềm 6 ms mỗi điểm cắt)
+→ trộn 3 lớp ambient `amix=inputs=4:duration=first:normalize=0` (giọng gốc giữ 100%).
+Nếu không có `--ambient-dir`: trộn `anoisesrc=color=pink:r=44100:a=0.02` + nhạc nền (âm lượng 0.03–0.05, fade-out 1.5 s cuối).
+
+**Lớp phủ ngà lạnh** nằm ở tầng trên cùng, sau grain. Thứ tự các lớp từ dưới lên: 3 ảnh nền → video → mờ hardsub → FX
+→ phụ đề → ghost → grain → lớp phủ ngà lạnh.
 
 **Xuất:** `-c:v libx264 -profile:v high -level 4.1 -pix_fmt yuv420p -b:v <5700–6300k> -maxrate 8M -c:a aac -b:a 192k`
 `-map_metadata -1 -fflags +bitexact -flags:v +bitexact -flags:a +bitexact`.
@@ -98,6 +108,20 @@ thì phần thừa bị cắt bỏ. Không dùng `-shortest` vì ffmpeg cắt th
   frame đầu được bù bằng cách lặp lại, tránh để hình chạy sớm hơn tiếng 1 frame.
 - **amix** dùng `normalize=0`, nếu không ffmpeg sẽ chia đôi âm lượng giọng nói khi trộn nhiễu.
 - Video không có tiếng vẫn có track audio (nhiễu nền + nhạc nền).
+
+## Cắt nhịp và đồng bộ hình/tiếng
+
+Cắt nhịp chạy trên timeline 29.97 FPS sau khi đã tăng tốc. Frame `k` (bắt đầu ở `k*1001/30000` giây) bị bỏ khi
+`(k*1001) mod 36000 > 33000`, tức là đúng điều kiện `mod(t,1.2) > 1.1` nhưng tính bằng số nguyên để không sai số làm tròn.
+Audio dùng chính công thức đó cho từng nhóm 32 mẫu, nên mỗi mẫu âm thanh được giữ hoặc bỏ theo đúng frame hình chứa nó.
+Hai bên mỗi điểm cắt được làm mềm 6 ms để không có tiếng "tách". Khác với lệnh mẫu trong bản yêu cầu:
+`select` dùng số frame `n` thay cho `t`, và `setpts=N*1001/30000/TB` thay cho `N/(29.97*TB)`, vì 29.97 chỉ là số làm tròn của 30000/1001.
+
+Kiểm tra: video thử có 16 lần chớp trắng kèm tiếng bíp cùng lúc. Sau khi xử lý, cả 16 cặp vẫn còn đủ,
+lệch lớn nhất 26 ms (chưa tới 1 frame) và không tăng dần theo thời gian.
+
+Lưu ý: tham số `rs/gs/bs` của `colorbalance` là vùng tối (shadows), `rh/gh/bh` là vùng sáng (highlights);
+nếu muốn chỉnh vùng trung tính (midtones) thì dùng `rm/gm/bm`.
 
 ## Test
 

@@ -37,6 +37,8 @@ except ImportError:
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".ts", ".wmv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+BG_LAYER_OPACITY = (1.0, 0.5, 0.3)  # 3 lop anh nen: duoi cung -> tren
 
 FPS = "30000/1001"  # 29.97 FPS (gia tri NTSC chuan)
 SAMPLE_RATE = 44100
@@ -72,8 +74,10 @@ class Config:
     rotate_deg: float = 0.7
     flip: bool = False
     saturation: float = 1.12
-    contrast: float = 1.04
-    brightness: float = -0.02
+    contrast: float = 1.18
+    brightness: float = -0.04
+    # Ep tong nga lanh: day xanh nhe, ha vang nong (s = shadows, h = highlights)
+    colorbalance: str = "rs=-0.06:gs=0.01:bs=0.10:rh=-0.05:gh=0.02:bh=0.08"
     hue_range: float = 4.0
     drop_every: int = 145
     ghost: bool = True
@@ -96,11 +100,76 @@ class Config:
     silence_pad: float = 0.15
     hook_mode: str = "off"  # off | move | copy
     hook_len: float = 3.0
+    micro_cut: bool = True        # cu moi micro_period giay bo micro_len giay
+    micro_period: float = 1.2
+    micro_len: float = 0.1
+    ambient_files: list[Path] = field(default_factory=list)  # thay pink noise + BGM
+    ambient_volume: tuple[float, float] = (0.02, 0.03)
+    bg_files: list[Path] = field(default_factory=list)       # 3 lop anh nen duoi video
+    bg_scale: float = 0.85        # video chiem 85% khung khi co anh nen
+    overlay_on: bool = True       # lop phu nga lanh tren cung
+    overlay_file: Path | None = None  # texture 4K (anh/video); None = tu sinh lop mau
+    overlay_color: str = "0xEEF1F4"   # nga lanh
+    overlay_opacity: float = 0.06
 
     @property
     def fast_rate(self) -> int:
         """Sample rate cho asetrate: 44100 * speed."""
         return int(SAMPLE_RATE * self.speed + 0.5)
+
+
+class MicroCut:
+    """Cat nhip tren timeline 29.97 FPS: bo frame k neu (k*1001) mod P > C.
+
+    P = chu ky, C = phan giu lai, ca hai tinh theo don vi 1/30000 giay (frame k bat dau o
+    k*1001/30000 s). Tuong duong select='not(mod(t,1.2)>1.1)' nhung tinh bang so nguyen nen
+    video va audio luon bo dung cung mot doan.
+    """
+
+    FADE = 0.006  # giay lam mem 2 ben moi diem cat audio (chong tieng 'tach')
+
+    def __init__(self, period: float, length: float):
+        self.P = round(period * 30000)
+        self.C = round((period - length) * 30000)
+        self._prefix = [0]
+
+    def keep(self, k: int) -> bool:
+        return (k * 1001) % self.P <= self.C
+
+    def kept_before(self, k: int) -> int:
+        """So frame duoc giu trong [0, k)."""
+        while len(self._prefix) <= k:
+            j = len(self._prefix) - 1
+            self._prefix.append(self._prefix[-1] + self.keep(j))
+        return self._prefix[k]
+
+    def map_time(self, t: float) -> float:
+        """Thoi gian truoc cat -> sau cat (diem nam trong doan bi bo thi dinh vao cho noi)."""
+        x = max(0.0, t) * 30000 / 1001
+        k = int(x)
+        return (self.kept_before(k) + ((x - k) if self.keep(k) else 0.0)) * 1001 / 30000
+
+    def video_select(self) -> str:
+        return f"lte(mod(n*1001,{self.P}),{self.C})"
+
+    def audio_select(self) -> str:
+        return f"lte(mod(floor(t*30000/1001+1e-9)*1001,{self.P}),{self.C})"
+
+    def declick(self) -> str:
+        """He so am luong: giam ve 0 ngay truoc doan bi bo va tang lai ngay sau doan bi bo."""
+        P, C = self.P, self.C
+        return (f"st(0,floor(t*30000/{P}));"
+                f"st(1,(floor(({P}*ld(0)+{C})/1001)+1)*1001/30000);"   # dau doan bi bo cua chu ky nay
+                f"st(2,(floor(({P}*ld(0)-1)/1001)+1)*1001/30000);"     # cuoi doan bi bo cua chu ky truoc
+                f"clip(min(ld(1)-t,t-ld(2))/{self.FADE},0,1)")
+
+
+def output_frames(cfg: Config, src_duration: float) -> tuple[int, int]:
+    """(so frame truoc cat nhip, so frame xuat ra) cua video 29.97 FPS."""
+    frames = max(1, round(src_duration / cfg.speed * 30000 / 1001))
+    if not cfg.micro_cut:
+        return frames, frames
+    return frames, max(1, MicroCut(cfg.micro_period, cfg.micro_len).kept_before(frames))
 
 
 @dataclass
@@ -144,15 +213,23 @@ class Params:
     bgm_volume: float = 0.0
     edit: Edit | None = None
     src_duration: float = 0.0  # thoi luong (giay) sau cat lang/hook, truoc khi tang toc
+    ambient: list[tuple[Path, float, float]] = field(default_factory=list)  # (file, volume, giay bat dau)
+    bg_images: list[Path] = field(default_factory=list)
+    overlay_file: Path | None = None
 
-    def inputs(self) -> tuple[int | None, int | None]:
-        """Chi so input ffmpeg cua (hook, bgm). Input 0 luon la video goc."""
-        idx, hook, bgm = 1, None, None
-        if self.edit and self.edit.hook:
-            hook, idx = idx, idx + 1
+    def input_keys(self) -> list[str]:
+        """Thu tu cac input ffmpeg phu (input 0 luon la video goc)."""
+        keys = ["hook"] if self.edit and self.edit.hook else []
         if self.bgm:
-            bgm = idx
-        return hook, bgm
+            keys.append("bgm")
+        keys += [f"amb{i}" for i in range(len(self.ambient))]
+        keys += [f"bg{i}" for i in range(len(self.bg_images))]
+        if self.overlay_file:
+            keys.append("tex")
+        return keys
+
+    def idx(self, key: str) -> int:
+        return 1 + self.input_keys().index(key)
 
 
 @dataclass
@@ -365,11 +442,14 @@ def build_ass(cues, cfg: Config) -> str:
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    mc = MicroCut(cfg.micro_period, cfg.micro_len) if cfg.micro_cut else None
     for start, end, body in cues:
-        lines.append(
-            f"Dialogue: 0,{_ass_time(start / cfg.speed)},{_ass_time(end / cfg.speed)},"
-            f"Default,,0,0,0,,{_ass_text(body)}"
-        )
+        s, e = start / cfg.speed, end / cfg.speed
+        if mc:  # doi theo timeline sau khi cat nhip
+            s, e = mc.map_time(s), mc.map_time(e)
+        if e - s < 0.05:
+            continue
+        lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{_ass_text(body)}")
     return "\n".join(lines) + "\n"
 
 
@@ -390,12 +470,41 @@ def fx_schedule(duration: float, interval: tuple[float, float] | None,
     return events
 
 
+@functools.lru_cache(maxsize=256)
+def media_duration(path: Path) -> float:
+    """Thoi luong file am thanh/video (0 neu khong doc duoc)."""
+    try:
+        code, out, _ = run_proc(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "csv=p=0", str(path)])
+    except (OSError, Cancelled):
+        return 0.0
+    return _num(out.strip()) if code == 0 else 0.0
+
+
+def pick_ambient(cfg: Config, rng: random.Random) -> list[tuple[Path, float, float]]:
+    """3 lop ambient khac nhau (thieu file thi dung lai file voi diem bat dau khac)."""
+    files = cfg.ambient_files
+    if not files:
+        return []
+    chosen = rng.sample(files, 3) if len(files) >= 3 else [files[i % len(files)] for i in range(3)]
+    layers = []
+    for f in chosen:
+        dur = media_duration(f)
+        start = rng.uniform(0, dur * 0.8) if dur > 1 else 0.0
+        layers.append((f, round(rng.uniform(*cfg.ambient_volume), 4), round(start, 3)))
+    return layers
+
+
 def make_params(cfg: Config, src_duration: float, rng: random.Random, name: str,
                 bgm_files: list[Path], edit: Edit | None = None) -> Params:
-    out_duration = src_duration / cfg.speed
+    out_duration = output_frames(cfg, src_duration)[1] * 1001 / 30000
+    use_bgm = bool(bgm_files) and not cfg.ambient_files  # ambient thay the BGM
     return Params(
         edit=edit,
         src_duration=src_duration,
+        ambient=pick_ambient(cfg, rng),
+        bg_images=rng.sample(cfg.bg_files, min(3, len(cfg.bg_files))),
+        overlay_file=cfg.overlay_file if cfg.overlay_on else None,
         name=name,
         hue=round(rng.uniform(-cfg.hue_range, cfg.hue_range), 2),
         zoom_period=round(rng.uniform(*cfg.zoom_period), 3),
@@ -404,8 +513,8 @@ def make_params(cfg: Config, src_duration: float, rng: random.Random, name: str,
         ghost_gy=round(rng.uniform(0.3, 0.9), 3),
         bitrate_kbps=int(round(rng.uniform(*cfg.bitrate_mbps) * 1000)),
         fx_events=fx_schedule(out_duration, cfg.fx_interval, rng),
-        bgm=rng.choice(bgm_files) if bgm_files else None,
-        bgm_volume=round(rng.uniform(*cfg.bgm_volume), 4) if bgm_files else 0.0,
+        bgm=rng.choice(bgm_files) if use_bgm else None,
+        bgm_volume=round(rng.uniform(*cfg.bgm_volume), 4) if use_bgm else 0.0,
     )
 
 
@@ -554,7 +663,7 @@ def source_stage(info: MediaInfo, p: Params) -> tuple[list[str], str, str | None
     if not edit.hook:
         return g, "mv", "ma"
     # Hook: input rieng (-ss/-t) de khong phai dem frame trong bo nho, dat len dau bang concat
-    hook_idx, _ = p.inputs()
+    hook_idx = p.idx("hook")
     g.append(f"[{hook_idx}:v]setpts=PTS-STARTPTS[hv]")
     g.append(f"[{hook_idx}:a:0]asetpts=PTS-STARTPTS,{AFMT}[ha]")
     g.append("[hv][ha][mv][ma]concat=n=2:v=1:a=1[vsrc][asrc]")
@@ -590,9 +699,9 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
                        subs_file: str | None = None) -> str:
     W, H = cfg.width, cfg.height
     # Lam tron thoi luong xuat theo so frame 29.97 -> video va audio duoc ep ve cung 1 do dai
-    frames = max(1, round((p.src_duration or info.duration) / cfg.speed * 30000 / 1001))
-    out_dur = frames * 1001 / 30000
-    _, bgm_idx = p.inputs()
+    frames, kept = output_frames(cfg, p.src_duration or info.duration)
+    out_dur = kept * 1001 / 30000
+    mc = MicroCut(cfg.micro_period, cfg.micro_len) if cfg.micro_cut else None
 
     # 0) Silence cut + hook (neu bat)
     g, v_in, a_in = source_stage(info, p)
@@ -604,12 +713,31 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
         f"fps={FPS}:start_time=0,"  # neo moc 0: frame 0 bi select bo se duoc bu, khong lech A/V
         # Ep video dung `frames` frame: thieu (do drop/cat doan) thi lap frame cuoi (<1 frame), du thi cat.
         # Dat truoc zoom/grain nen frame lap van chuyen dong, khong bi dung hinh.
-        f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame={frames}[v0]"
+        f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame={frames}"
+        # Cat nhip: bo frame trong doan (1.1s, 1.2s] cua moi chu ky, noi lai lien tuc 29.97 FPS
+        + (f",select='{mc.video_select()}',setpts=N*1001/30000/TB" if mc else "")
+        + "[v0]"
     )
 
     # 2) Dua ve khung 9:16 1080x1920
     fit = resolve_fit(cfg, info)
-    if fit == "crop":
+    if p.bg_images:
+        # 3 lop anh nen o duoi cung (moi anh chi giai ma 1 lan, overlay giu anh suot video)
+        for i, _img in enumerate(p.bg_images):
+            chain = (f"[{p.idx(f'bg{i}')}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                     f"crop={W}:{H},setsar=1")
+            if i:
+                chain += f",format=rgba,colorchannelmixer=aa={BG_LAYER_OPACITY[i]}"
+            g.append(chain + f",fps={FPS}[bgl{i}]")
+        base = "bgl0"
+        for i in range(1, len(p.bg_images)):
+            g.append(f"[{base}][bgl{i}]overlay=0:0[bgs{i}]")
+            base = f"bgs{i}"
+        fw, fh = even(W * cfg.bg_scale), even(H * cfg.bg_scale)
+        g.append(f"[v0]scale={fw}:{fh}:force_original_aspect_ratio=decrease:"
+                 f"force_divisible_by=2,setsar=1[fgv]")
+        g.append(f"[{base}][fgv]overlay=(W-w)/2:(H-h)/2,setsar=1[v1]")
+    elif fit == "crop":
         g.append(f"[v0]scale={W}:{H}:force_original_aspect_ratio=increase,"
                  f"crop={W}:{H},setsar=1[v1]")
     else:
@@ -627,8 +755,10 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
         chain.append("hflip")
     if cfg.rotate_deg:
         chain.append(f"rotate={cfg.rotate_deg}*PI/180:c=black")
-    chain.append(f"eq=saturation={cfg.saturation}:contrast={cfg.contrast}:"
-                 f"brightness={cfg.brightness}")
+    chain.append(f"eq=contrast={cfg.contrast}:brightness={cfg.brightness}:"
+                 f"saturation={cfg.saturation}")
+    if cfg.colorbalance:
+        chain.append(f"colorbalance={cfg.colorbalance}")
     chain.append(f"hue=h={p.hue}")  # eq khong co tham so hue -> dung filter hue
     z = zoom_expr(cfg, p)
     sw, sh = f"2*trunc({W}*{z}/2)", f"2*trunc({H}*{z}/2)"
@@ -683,6 +813,19 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
         g.append(f"[{last}]format=yuv420p[vg]")
         g.append(f"[vg][grain]blend=all_mode=overlay:all_opacity={cfg.grain}:shortest=1[v6]")
         last = "v6"
+
+    # 9) Lop phu nga lanh 4K o TANG TREN CUNG (texture anh/video, hoac lop mau tu sinh)
+    if cfg.overlay_on:
+        alpha = f"format=rgba,colorchannelmixer=aa={cfg.overlay_opacity}"
+        cover = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1"
+        if p.overlay_file is None:
+            g.append(f"color=c={cfg.overlay_color}:s={W}x{H}:r={FPS}:d=0.1,{alpha}[tex]")
+        elif p.overlay_file.suffix.lower() in VIDEO_EXTS:
+            g.append(f"[{p.idx('tex')}:v]{cover},fps={FPS},{alpha}[tex]")
+        else:  # anh: giai ma 1 lan, overlay giu anh suot video
+            g.append(f"[{p.idx('tex')}:v]{cover},{alpha},fps={FPS}[tex]")
+        g.append(f"[{last}][tex]overlay=0:0:shortest=0:eof_action=repeat[v7]")
+        last = "v7"
     g.append(f"[{last}]format=yuv420p[vout]")
 
     # ---------------- Audio: 6 buoc ----------------
@@ -698,19 +841,33 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
             # B4: chorus
             "chorus=0.7:0.9:15:0.4:0.25:2,"
             # B5: stereo panning
-            "pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1[voice]"
+            "pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1"
+            # Cat nhip giong video: chia frame nho (32 mau) de cat chinh xac, lam mem 6ms 2 ben
+            + (f",asetnsamples=n=32:p=0,volume=eval=frame:volume='{mc.declick()}',"
+               f"aselect='{mc.audio_select()}',asetpts=N/SR/TB,asetnsamples=n=1024:p=0" if mc else "")
+            + "[voice]"
         )
     else:
         g.append(f"anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=end={out_dur:.3f}[voice]")
+    fade_st = max(0.0, out_dur - cfg.bgm_fade)
+    if p.ambient:
+        # B6: 3 lop am thanh moi truong (moi lop 2-3%), giong goc giu nguyen 100% (normalize=0)
+        for i, (_f, vol, _start) in enumerate(p.ambient):
+            g.append(f"[{p.idx(f'amb{i}')}:a:0]{AFMT},volume={vol},atrim=end={out_dur:.3f},"
+                     f"asetpts=PTS-STARTPTS,afade=t=out:st={fade_st:.3f}:d={cfg.bgm_fade}[amb{i}]")
+        labels = "".join(f"[amb{i}]" for i in range(len(p.ambient)))
+        g.append(f"[voice]{labels}amix=inputs={1 + len(p.ambient)}:duration=first:normalize=0[vm]")
+        g.append(f"[vm]apad=whole_dur={out_dur:.3f},atrim=duration={out_dur:.3f}[aout]")
+        return ";\n".join(g) + "\n"
+
     # B6: noise layering + BGM
     g.append(f"anoisesrc=color=pink:r={SAMPLE_RATE}:a={cfg.noise_amp},"
              "aformat=sample_fmts=fltp:channel_layouts=stereo[noise]")
     g.append("[voice][noise]amix=inputs=2:duration=first:normalize=0[vn]")
     last_a = "vn"
     if p.bgm:
-        fade_st = max(0.0, out_dur - cfg.bgm_fade)
         g.append(
-            f"[{bgm_idx}:a:0]{AFMT},"
+            f"[{p.idx('bgm')}:a:0]{AFMT},"
             f"volume={p.bgm_volume},atrim=end={out_dur:.3f},asetpts=PTS-STARTPTS,"
             f"afade=t=out:st={fade_st:.3f}:d={cfg.bgm_fade}[bgm]"
         )
@@ -744,11 +901,21 @@ def filter_script_args(filter_file: str) -> list[str]:
 def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
            "-i", str(src)]
-    if p.edit and p.edit.hook:  # input thu 2: doan hook cat san bang -ss/-t
-        h0, h1 = p.edit.hook
-        cmd += ["-ss", f"{h0:.3f}", "-t", f"{h1 - h0:.3f}", "-i", str(src)]
-    if p.bgm:
-        cmd += ["-stream_loop", "-1", "-i", str(p.bgm.resolve())]
+    # Input phu, dung thu tu Params.input_keys() (filter graph tham chieu theo chi so)
+    for key in p.input_keys():
+        if key == "hook":  # doan hook cat san bang -ss/-t
+            h0, h1 = p.edit.hook
+            cmd += ["-ss", f"{h0:.3f}", "-t", f"{h1 - h0:.3f}", "-i", str(src)]
+        elif key == "bgm":
+            cmd += ["-stream_loop", "-1", "-i", str(p.bgm.resolve())]
+        elif key.startswith("amb"):  # ambient lap lai, bat dau o vi tri ngau nhien
+            f, _vol, start = p.ambient[int(key[3:])]
+            cmd += ["-stream_loop", "-1", "-ss", f"{start:.3f}", "-i", str(f.resolve())]
+        elif key.startswith("bg"):  # anh nen: 1 frame
+            cmd += ["-i", str(p.bg_images[int(key[2:])].resolve())]
+        elif key == "tex":
+            tex = p.overlay_file.resolve()
+            cmd += (["-stream_loop", "-1"] if tex.suffix.lower() in VIDEO_EXTS else []) + ["-i", str(tex)]
     cmd += [
         *filter_script_args(filter_file),
         # Khong dung -shortest: audio/video da duoc ep cung so frame trong filter graph,
@@ -900,6 +1067,8 @@ def format_result(r: Result) -> str:
     return (f"[OK]  {r.src.name} -> {r.output.name} ({r.elapsed:.1f}s) | "
             f"bitrate={p.bitrate_kbps}k hue={p.hue} zoom_period={p.zoom_period}s "
             f"fx={len(p.fx_events)}" + (f" bgm={p.bgm.name}@{p.bgm_volume}" if p.bgm else "")
+            + (f" ambient={'+'.join(f.name for f, _, _ in p.ambient)}" if p.ambient else "")
+            + (f" nen={len(p.bg_images)} anh" if p.bg_images else "")
             + describe_edit(p.edit))
 
 
@@ -965,6 +1134,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="dua doan am thanh cao trao nhat len dau: move=chuyen (cat khoi cho cu), "
                          "copy=nhan ban (mac dinh: off)")
     ap.add_argument("--hook-len", type=float, default=3.0, help="do dai hook, giay (mac dinh: 3)")
+    ap.add_argument("--micro-cut", action=argparse.BooleanOptionalAction, default=True,
+                    help="cat nhip: cu moi 1.2s bo 0.1s (mac dinh: bat; tat bang --no-micro-cut)")
+    ap.add_argument("--micro-period", type=float, default=1.2, help="chu ky cat nhip, giay (mac dinh: 1.2)")
+    ap.add_argument("--micro-len", type=float, default=0.1, help="do dai bi cat moi chu ky, giay (mac dinh: 0.1)")
+    ap.add_argument("--ambient-dir", help="thu muc am thanh moi truong: tron 3 lop (2-3%%) thay pink noise + BGM")
+    ap.add_argument("--bg-dir", help="thu muc anh nen: 3 anh ngau nhien xep chong duoi video")
+    ap.add_argument("--bg-scale", type=float, default=0.85,
+                    help="kich thuoc video khi co anh nen, ti le khung (mac dinh: 0.85)")
+    ap.add_argument("--overlay-4k", help="file texture nga lanh (anh hoac video) phu tren cung; "
+                                         "bo trong = tu sinh lop mau nga lanh")
+    ap.add_argument("--overlay-opacity", type=float, default=0.06, help="do mo lop phu (mac dinh: 0.06)")
+    ap.add_argument("--no-overlay", action="store_true", help="tat lop phu nga lanh")
     ap.add_argument("--seed", type=int, help="seed de tai lap tham so ngau nhien")
     ap.add_argument("--dry-run", action="store_true", help="chi in lenh ffmpeg + filter, khong render")
     ap.add_argument("--keep-temp", action="store_true", help="giu lai file tam (de debug)")
@@ -1006,7 +1187,29 @@ def config_from_args(a: argparse.Namespace) -> Config:
         silence_pad=max(0.0, a.silence_pad),
         hook_mode=a.hook,
         hook_len=a.hook_len,
+        micro_cut=a.micro_cut,
+        micro_period=a.micro_period,
+        micro_len=a.micro_len,
+        bg_scale=min(1.0, max(0.3, a.bg_scale)),
+        overlay_on=not a.no_overlay,
+        overlay_opacity=min(1.0, max(0.0, a.overlay_opacity)),
     )
+    if cfg.micro_cut and not (1001 / 30000 <= cfg.micro_len < cfg.micro_period):
+        raise SystemExit("--micro-len phai >= 0.034 (1 frame) va nho hon --micro-period")
+    for opt, folder, exts, attr in (("--ambient-dir", a.ambient_dir, AUDIO_EXTS, "ambient_files"),
+                                    ("--bg-dir", a.bg_dir, IMAGE_EXTS, "bg_files")):
+        if folder:
+            files = collect_files([str(Path(folder).expanduser())], exts)
+            if not files:
+                raise SystemExit(f"{opt}: khong tim thay file phu hop trong '{folder}'")
+            setattr(cfg, attr, files)
+    if a.overlay_4k:
+        tex = Path(a.overlay_4k).expanduser()
+        if not tex.is_file():
+            raise SystemExit(f"--overlay-4k: khong tim thay file '{a.overlay_4k}'")
+        cfg.overlay_file = tex
+    if cfg.ambient_files and a.bgm:
+        log("[canh bao] da dung --ambient-dir nen bo qua --bgm (ambient thay pink noise + BGM)")
     if cfg.hook_mode != "off" and cfg.hook_len <= 0:
         raise SystemExit("--hook-len phai > 0")
     if cfg.preset == "ultrafast":
@@ -1170,6 +1373,15 @@ class GuiApp:
         self.bgm_var = tk.StringVar(value=s.get("bgm", ""))
         self.jobs_var = tk.IntVar(value=s.get("jobs", 1))
         self.fast_var = tk.BooleanVar(value=s.get("fast", False))
+        self.micro_var = tk.BooleanVar(value=s.get("micro_cut", True))
+        # Thu muc ambient/ va background/ canh script duoc dien san neu co
+        amb_dir, bg_dir = SCRIPT_DIR / "ambient", SCRIPT_DIR / "background"
+        self.ambient_on_var = tk.BooleanVar(value=s.get("ambient_on", amb_dir.is_dir()))
+        self.ambient_var = tk.StringVar(value=s.get("ambient", str(amb_dir) if amb_dir.is_dir() else ""))
+        self.bg_on_var = tk.BooleanVar(value=s.get("bg_on", bg_dir.is_dir()))
+        self.bg_var = tk.StringVar(value=s.get("bg", str(bg_dir) if bg_dir.is_dir() else ""))
+        self.overlay_on_var = tk.BooleanVar(value=s.get("overlay_on", True))
+        self.overlay_var = tk.StringVar(value=s.get("overlay", ""))
         self.status_var = tk.StringVar(value="Thêm video rồi bấm Bắt đầu.")
 
         self._build()
@@ -1195,7 +1407,7 @@ class GuiApp:
     def _build(self):
         r = self.root
         r.title("Video Chuẩn")
-        r.minsize(640, 660)
+        r.minsize(700, 800)
         bold = tkfont.nametofont("TkDefaultFont").copy()
         bold.configure(weight="bold")
         main = ttk.Frame(r, padding=14)
@@ -1240,27 +1452,39 @@ class GuiApp:
         opt.columnconfigure(1, weight=1)
         for row, (text, var) in enumerate([
             ("Lật ngang video", self.flip_var),
+            ("Cắt nhịp: cứ mỗi 1.2 giây bỏ 0.1 giây (hình + tiếng)", self.micro_var),
             ("Tự cắt khoảng lặng", self.silence_var),
             ("Tự chèn phụ đề (file .srt trùng tên, đặt cạnh video)", self.subs_var),
         ]):
-            ttk.Checkbutton(opt, text=text, variable=var).grid(row=row, column=0, columnspan=3, sticky="w")
+            ttk.Checkbutton(opt, text=text, variable=var).grid(row=row, column=0, columnspan=4, sticky="w")
         hf = ttk.Frame(opt)
-        hf.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        hf.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
         ttk.Label(hf, text="Hook 3 giây cao trào:").pack(side="left")
         for val, text in (("off", "Tắt"), ("move", "Chuyển lên đầu"), ("copy", "Nhân bản lên đầu")):
             ttk.Radiobutton(hf, text=text, value=val, variable=self.hook_var).pack(side="left", padx=(10, 0))
-        ttk.Checkbutton(opt, text="Nhạc nền:", variable=self.bgm_on_var).grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(opt, textvariable=self.bgm_var).grid(row=4, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
-        ttk.Button(opt, text="File…", command=self._pick_bgm_file).grid(row=4, column=2, padx=(6, 0), pady=(6, 0))
-        ttk.Button(opt, text="Thư mục…", command=self._pick_bgm_dir).grid(row=4, column=3, padx=(6, 0), pady=(6, 0))
+        # Hang chon duong dan: [x] nhan | o nhap | nut chon
+        for row, (text, on_var, path_var, buttons) in enumerate([
+            ("Âm thanh môi trường (3 lớp):", self.ambient_on_var, self.ambient_var,
+             [("Thư mục…", lambda: self._pick_dir_into(self.ambient_var, self.ambient_on_var))]),
+            ("Nhạc nền (khi không dùng âm thanh môi trường):", self.bgm_on_var, self.bgm_var,
+             [("File…", self._pick_bgm_file), ("Thư mục…", self._pick_bgm_dir)]),
+            ("Ảnh nền 3 lớp dưới video:", self.bg_on_var, self.bg_var,
+             [("Thư mục…", lambda: self._pick_dir_into(self.bg_var, self.bg_on_var))]),
+            ("Lớp phủ ngà lạnh trên cùng (bỏ trống = tự tạo):", self.overlay_on_var, self.overlay_var,
+             [("File…", self._pick_overlay_file)]),
+        ], start=5):
+            ttk.Checkbutton(opt, text=text, variable=on_var).grid(row=row, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(opt, textvariable=path_var).grid(row=row, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
+            for col, (label, cmd) in enumerate(buttons, start=2):
+                ttk.Button(opt, text=label, command=cmd).grid(row=row, column=col, padx=(6, 0), pady=(6, 0))
         jf = ttk.Frame(opt)
-        jf.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        jf.grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(jf, text="Số video chạy cùng lúc:").pack(side="left")
         ttk.Spinbox(jf, from_=1, to=max(1, os.cpu_count() or 1), width=4, state="readonly",
                     textvariable=self.jobs_var).pack(side="left", padx=6)
         ttk.Label(jf, text="(1 = xong video này mới sang video sau)").pack(side="left")
         ttk.Checkbutton(opt, text="Render nhanh (chất lượng giảm nhẹ)", variable=self.fast_var).grid(
-            row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            row=10, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         rf = ttk.Frame(main)
         rf.grid(row=7, column=0, sticky="ew", pady=(16, 4))
@@ -1336,6 +1560,20 @@ class GuiApp:
             self.bgm_var.set(n)
             self.bgm_on_var.set(True)
 
+    def _pick_dir_into(self, path_var, on_var):
+        d = filedialog.askdirectory(parent=self.root, title="Chọn thư mục")
+        if d:
+            path_var.set(d)
+            on_var.set(True)
+
+    def _pick_overlay_file(self):
+        pats = " ".join(f"*{e} *{e.upper()}" for e in sorted(IMAGE_EXTS | VIDEO_EXTS))
+        n = filedialog.askopenfilename(parent=self.root, title="Chọn texture 4K ngà lạnh",
+                                       filetypes=[("Ảnh / video", pats), ("Tất cả", "*")])
+        if n:
+            self.overlay_var.set(n)
+            self.overlay_on_var.set(True)
+
     def _pick_bgm_dir(self):
         d = filedialog.askdirectory(parent=self.root, title="Chọn thư mục nhạc nền")
         if d:
@@ -1369,7 +1607,28 @@ class GuiApp:
             argv.append("--flip")
         if self.silence_var.get():
             argv.append("--silence-cut")
-        cfg = config_from_args(parse_args(argv))
+        if not self.micro_var.get():
+            argv.append("--no-micro-cut")
+        for on_var, path_var, opt, what in ((self.ambient_on_var, self.ambient_var, "--ambient-dir",
+                                             "thư mục âm thanh môi trường"),
+                                            (self.bg_on_var, self.bg_var, "--bg-dir", "thư mục ảnh nền")):
+            if on_var.get():
+                if not path_var.get().strip():
+                    messagebox.showwarning("Video Chuẩn", f"Chưa chọn {what}. Chọn thư mục, hoặc bỏ tích.",
+                                           parent=self.root)
+                    return
+                argv += [opt, path_var.get().strip()]
+        if not self.overlay_on_var.get():
+            argv.append("--no-overlay")
+        elif self.overlay_var.get().strip():
+            argv += ["--overlay-4k", self.overlay_var.get().strip()]
+        try:
+            cfg = config_from_args(parse_args(argv))
+        except SystemExit as exc:  # thu muc/file khong hop le
+            messagebox.showwarning("Video Chuẩn", str(exc), parent=self.root)
+            return
+        if cfg.ambient_files:
+            bgm_files = []  # am thanh moi truong thay nhac nen
         self.jobs = max(1, int(self.jobs_var.get()))
         if self.jobs > 1:
             cfg.threads = max(1, (os.cpu_count() or 1) // self.jobs)
@@ -1515,7 +1774,10 @@ class GuiApp:
         data = {"output": self.out_var.get(), "flip": self.flip_var.get(),
                 "silence_cut": self.silence_var.get(), "hook": self.hook_var.get(),
                 "subs": self.subs_var.get(), "bgm_on": self.bgm_on_var.get(),
-                "bgm": self.bgm_var.get(), "jobs": int(self.jobs_var.get()), "fast": self.fast_var.get()}
+                "bgm": self.bgm_var.get(), "jobs": int(self.jobs_var.get()), "fast": self.fast_var.get(),
+                "micro_cut": self.micro_var.get(), "ambient_on": self.ambient_on_var.get(),
+                "ambient": self.ambient_var.get(), "bg_on": self.bg_on_var.get(), "bg": self.bg_var.get(),
+                "overlay_on": self.overlay_on_var.get(), "overlay": self.overlay_var.get()}
         try:
             SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         except OSError:
