@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from array import array
 from pathlib import Path
 
@@ -81,23 +82,26 @@ class TestFilterGraph(unittest.TestCase):
             "select='not(eq(mod(n\\,145)\\,0))',fps=30000/1001",
             "tpad=stop_mode=clone:stop_duration=0.5,trim=end_frame=563",  # round(20/1.065*29.97) = round(562.8)
             "hflip,rotate=0.7*PI/180:c=black",
-            "eq=contrast=1.18:brightness=-0.04:saturation=1.12,"
-            "colorbalance=rs=-0.06:gs=0.01:bs=0.10:rh=-0.05:gh=0.02:bh=0.08,",
+            "eq=contrast=1.15:brightness=-0.03:saturation=1.08,"
+            "colorbalance=rs=-0.05:gs=0.01:bs=0.08:rh=-0.04:gh=0.02:bh=0.06,",
             f"hue=h={p.hue}",
-            f"1.06000+0.02000*sin(2*PI*t/{p.zoom_period}+{p.zoom_phase})",
+            f"1.23000+0.02000*sin(2*PI*t/{p.zoom_period}+{p.zoom_phase})",  # zoom goc 1.23
+            f"*sin(2*PI*t/{p.pan[0]}+{p.pan[1]})",  # camera troi ngang theo sin
+            f"*cos(2*PI*t/{p.pan[2]}+{p.pan[3]})",  # va doc theo cos
+            "3.0*(0.6*sin(t*17.3+",  # rung nhe moi frame
             ":eval=frame,crop=1080:1920:",
             "crop=1080:384:0:1440,boxblur",  # X=0 Y=0.75 W=1 H=0.2
             "ass=filename=a1b2c3d4.subs.ass",
             "color=c=white@0.015:s=150x150:r=30000/1001",
             f"sin(t*{p.ghost_gx})", f"cos(t*{p.ghost_gy})",
-            "blend=all_mode=overlay:all_opacity=0.045",
+            "format=yuv420p,noise=alls=3:allf=t+u,format=yuv420p[vout]",  # hat nhe o tang cuoi
             "asetrate=46967,aresample=44100",
             "highpass=f=120,lowpass=f=8000,equalizer=f=1000:width_type=h:width=200:g=2",
             "acompressor=threshold=-15dB:ratio=4:attack=5:release=50",
             "chorus=0.7:0.9:15:0.4:0.25:2",
             "pan=stereo|c0=0.6*c0+0.4*c1|c1=0.4*c0+0.6*c1",
             "anoisesrc=color=pink:r=44100:a=0.02",
-            "[voice][noise]amix=inputs=2",
+            "[voice][noise][bgm]amix=inputs=3:duration=first:normalize=0",
             f"volume={p.bgm_volume}",
             # cat nhip: 563 frame -> giu 518 frame = 17.284s
             "trim=end_frame=563,select='lte(mod(n*1001,36000),33000)',setpts=N*1001/30000/TB[v0]",
@@ -105,7 +109,7 @@ class TestFilterGraph(unittest.TestCase):
             "aselect='lte(mod(floor(t*30000/1001+1e-9)*1001,36000),33000)',asetpts=N/SR/TB",
             "afade=t=out:st=15.784:d=1.5",
             "apad=whole_dur=17.284,atrim=duration=17.284[aout]",
-            "[v6][tex]overlay=0:0",  # lop phu nga lanh sau grain = tren cung
+            "[v5][tex]overlay=0:0",  # lop phu nga lanh tren video/ghost
             "color=c=0xEEF1F4:s=1080x1920",
             "[vout]", "[aout]",
         ]:
@@ -251,11 +255,13 @@ class TestMicroCut(unittest.TestCase):
                       "setsar=1,fps=30000/1001[bgl0]", g)
         self.assertIn("colorchannelmixer=aa=0.5,fps=30000/1001[bgl1]", g)
         self.assertIn("colorchannelmixer=aa=0.3,fps=30000/1001[bgl2]", g)
-        self.assertIn("[bgs2][fgv]overlay=(W-w)/2:(H-h)/2", g)  # video nam tren 3 lop nen
-        self.assertIn("[v0]scale=918:1632:force_original_aspect_ratio=decrease", g)
+        self.assertIn("[bgs2][fgv]overlay=(W-w)/2:(H-h)/2,setsar=1,eq=contrast=", g)  # video tren 3 lop nen
+        # zoom/camera va lam mo hardsub ap len video chinh TRUOC khi thu nho va dat len nen
+        self.assertIn("[v3]scale=918:1632:force_original_aspect_ratio=decrease", g)
+        self.assertLess(g.index("crop=1080:1920:'clip("), g.index("[v3]scale=918:1632"))
         self.assertIn("[7:v]scale=1080:1920", g)  # texture la input 7
-        # thu tu tang: nen -> video -> ... -> grain -> lop phu nga lanh -> xuat
-        order = [g.index(x) for x in ("[bgs2][fgv]overlay", "blend=all_mode", "[v6][tex]overlay", "[vout]")]
+        # thu tu tang: nen -> video -> ... -> lop phu nga lanh -> hat nhieu -> xuat
+        order = [g.index(x) for x in ("[bgs2][fgv]overlay", "[v5][tex]overlay", "noise=alls", "[vout]")]
         self.assertEqual(order, sorted(order))
         cmd = vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4")
         i_args = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
@@ -271,6 +277,90 @@ class TestMicroCut(unittest.TestCase):
             vc.config_from_args(vc.parse_args(["x.mp4", "--micro-len", "0.01"]))
         with self.assertRaises(SystemExit):
             vc.config_from_args(vc.parse_args(["x.mp4", "--ambient-dir", "/khong/co/thu/muc"]))
+
+
+class TestIntroAndBgVideo(unittest.TestCase):
+    INTRO = vc.MediaInfo(2.5, 1280, 720, True)
+    BGV = vc.MediaInfo(10.0, 720, 1280, True)
+
+    def _params(self, cfg, base=17.0):
+        infos = {"intro.mp4": self.INTRO, "bgv.mp4": self.BGV}
+        with mock.patch.object(vc, "probe_cached", lambda path: infos[Path(path).name]):
+            return vc.make_params(cfg, base, random.Random(1), "a1b2c3d4", [],
+                                  vc.Edit([(3.0, 20.0)]))
+
+    def test_build_edit_drops_first_seconds(self):
+        e = vc.build_edit(vc.Config(), 20.0, [], [], start=3.0)
+        self.assertEqual(e.segments, [(3.0, 20.0)])
+        energy = [1.0] * 200
+        energy[10:40] = [99.0] * 30  # cao trao o 1-4s (nam trong phan bi bo) -> khong duoc chon
+        energy[100:130] = [50.0] * 30
+        self.assertEqual(vc.pick_hook(energy, 3.0, 20.0, start=3.0), (10.0, 13.0))
+
+    def test_graph_and_command(self):
+        cfg = vc.Config(intro_files=[Path("/x/intro.mp4")], bg_video_files=[Path("/x/bgv.mp4")],
+                        bg_files=[Path("/x/bg.jpg")])
+        p = self._params(cfg)
+        self.assertAlmostEqual(p.src_duration, 17.0 + 2.5)
+        self.assertEqual(p.bg_images, [])  # video nen thay anh nen
+        self.assertEqual(p.input_keys(), ["intro", "bgv"])
+        g = vc.build_filter_graph(cfg, p, INFO)
+        for s in [
+            "[0:v]setpts=PTS-STARTPTS,select='between(t,3.000,20.000)'",  # bo 3s dau
+            "[1:v]split[ibg0][ifg0]",  # clip mo dau ngang -> nen mo, dua ve 1080x1920
+            "[ifit][iaud][mfit][maud]concat=n=2:v=1:a=1[vin][ain]",
+            "[vin]setpts=(PTS-STARTPTS)/1.065",
+            "[2:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,"
+            "fps=30000/1001,setpts=N*1001/30000/TB,format=yuv420p[bgvid]",
+            "[bgvid][fgv]overlay=(W-w)/2:(H-h)/2:shortest=1",
+            "[2:a:0]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.03,",
+            "[voice][noise][bgva]amix=inputs=3:duration=first:normalize=0",
+            "[ain]asetpts=PTS-STARTPTS",
+        ]:
+            self.assertIn(s, g)
+        cmd = " ".join(vc.build_command(cfg, p, Path("/in.mp4"), "f.txt", "o.mp4"))
+        self.assertIn(f"-i /in.mp4 -i /x/intro.mp4 -stream_loop -1 -ss {p.bg_video_start:.3f} -i /x/bgv.mp4", cmd)
+
+    def test_cli(self):
+        cfg = vc.config_from_args(vc.parse_args(["x.mp4", "--zoom-level", "1.3", "--shake", "0"]))
+        self.assertEqual((cfg.zoom_min, cfg.zoom_max, cfg.shake_px), (1.28, 1.32, 0.0))
+        cfg = vc.config_from_args(vc.parse_args(["x.mp4"]))
+        self.assertEqual((cfg.zoom_min, cfg.zoom_max, cfg.grain, cfg.bg_audio_vol), (1.21, 1.25, 3.0, 0.03))
+        for bad in (["--hook-dir", "/khong/co"], ["--bg-video-dir", "/khong/co"], ["--zoom-level", "0.9"]):
+            with self.assertRaises(SystemExit):
+                vc.config_from_args(vc.parse_args(["x.mp4", *bad]))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
+class TestIntroBgVideoRender(unittest.TestCase):
+    def test_render(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            for sub in ("hook", "bgv"):
+                (d / sub).mkdir()
+            run = lambda *a: subprocess.run(["ffmpeg", "-loglevel", "error", *a], check=True)  # noqa: E731
+            run("-f", "lavfi", "-i", "color=c=red:s=640x360:r=25:d=2.5", "-f", "lavfi", "-i",
+                "sine=f=440:d=2.5", "-shortest", "-c:v", "libx264", "-preset", "ultrafast", str(d / "hook" / "i.mp4"))
+            run("-f", "lavfi", "-i", "testsrc2=s=360x640:r=24:d=3", "-f", "lavfi", "-i", "sine=f=220:d=3",
+                "-shortest", "-c:v", "libx264", "-preset", "ultrafast", str(d / "bgv" / "b.mp4"))
+            run("-f", "lavfi", "-i", "color=c=blue:s=360x640:r=30:d=8", "-f", "lavfi", "-i", "sine=f=660:d=8",
+                "-shortest", "-c:v", "libx264", "-preset", "ultrafast", str(d / "src.mp4"))
+            rc = vc.main([str(d / "src.mp4"), "-o", str(d / "out"), "--hook-dir", str(d / "hook"),
+                          "--bg-video-dir", str(d / "bgv"), "--no-fx", "--preset", "superfast", "--seed", "4"])
+            self.assertEqual(rc, 0)
+            (out,) = (d / "out").iterdir()
+            dur = TestEndToEnd._durations(None, out)
+            frames = vc.output_frames(vc.Config(), (8 - 3) + 2.5)[1]
+            self.assertAlmostEqual(dur["video"], frames * 1001 / 30000, delta=0.05)
+            self.assertAlmostEqual(dur["audio"], dur["video"], delta=0.005)
+            # Giua frame dau la clip mo dau (do), giua frame cuoi la video goc (xanh duong)
+            px = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(out), "-vf",
+                                 "select='eq(n,5)+eq(n,150)',crop=40:40:(iw-40)/2:(ih-40)/2,scale=1:1",
+                                 "-fps_mode", "vfr", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                capture_output=True, check=True).stdout
+            (r1, g1, b1), (r2, g2, b2) = px[:3], px[3:6]
+            self.assertGreater(r1, b1 + 60)
+            self.assertGreater(b2, r2 + 60)
 
 
 @unittest.skipUnless(HAS_FFMPEG, "can ffmpeg/ffprobe")
