@@ -793,6 +793,9 @@ def build_filter_graph(cfg: Config, p: Params, info: MediaInfo,
                   f"enable='{_enable(glitches, GLITCH_DUR)}'")
     # 6) Phu de moi (nam trong safe zone)
     if subs_file:
+        # subs_file luon la ten hex tuong doi ("a1b2c3d4.subs.ass"), ffmpeg chay voi cwd = thu muc
+        # xuat, nen khong can escape. Khong truyen duong dan tuyet doi vao day: dau ':' (vd. "C:\")
+        # bi tach thanh option khac ngay ca khi boc trong nhay don.
         fx.append(f"ass=filename={subs_file}")
     if fx:
         g.append(f"[{last}]" + ",".join(fx) + "[v4]")
@@ -899,8 +902,12 @@ def filter_script_args(filter_file: str) -> list[str]:
 
 
 def build_command(cfg: Config, p: Params, src: Path, filter_file: str, part_file: str) -> list[str]:
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
-           "-i", str(src)]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error"]
+    if cfg.threads:
+        # Chay nhieu file cung luc (-j > 1): chia CPU cho ca filter graph va bo giai ma, khong chi
+        # encoder. Dung -filter_complex_threads (-filter_threads chi ap dung cho -vf/-af don gian).
+        cmd += ["-filter_complex_threads", str(cfg.threads), "-threads", str(cfg.threads)]
+    cmd += ["-i", str(src)]
     # Input phu, dung thu tu Params.input_keys() (filter graph tham chieu theo chi so)
     for key in p.input_keys():
         if key == "hook":  # doan hook cat san bang -ss/-t

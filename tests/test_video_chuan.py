@@ -125,6 +125,14 @@ class TestFilterGraph(unittest.TestCase):
         self.assertIn("anullsrc", g)
         self.assertIn("[bg0]", g)  # video ngang -> fit=auto chon nen mo
 
+    def test_threads_limited_when_parallel(self):
+        cfg = vc.Config(threads=3)
+        cmd = vc.build_command(cfg, params(cfg), Path("/in.mp4"), "f.txt", "o.mp4")
+        i = cmd.index("-i")
+        self.assertEqual(cmd[i - 4:i], ["-filter_complex_threads", "3", "-threads", "3"])
+        self.assertNotIn("-filter_complex_threads", vc.build_command(vc.Config(), params(vc.Config()),
+                                                                     Path("/in.mp4"), "f.txt", "o.mp4"))
+
     def test_command(self):
         cfg = vc.Config()
         p = params(cfg)
